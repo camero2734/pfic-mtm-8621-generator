@@ -73,7 +73,15 @@ def add_pfic_info(c, coordinates, df_pfic: pd.DataFrame):
     print(df_pfic)
     keys = ["PFIC Name", "PFIC Address", "PFIC Reference ID", "PFIC Share Class"]
     for key in keys:
-        c.drawString(coordinates[key][0], coordinates[key][1], df_pfic[key].values[0])
+        value = df_pfic[key].values[0]
+        if key == "PFIC Address" and isinstance(value, str) and "\n" in value:
+            lines = value.split("\n")
+            y = coordinates[key][1]
+            for line in lines:
+                c.drawString(coordinates[key][0], y, line)
+                y -= 12
+        else:
+            c.drawString(coordinates[key][0], coordinates[key][1], value)
 
 
 def add_part_1(c, coordinates, df_lot, df_eoy, current_year):
@@ -89,10 +97,8 @@ def add_part_1(c, coordinates, df_lot, df_eoy, current_year):
     for lot in range(len(df_lot.index)):
         # Check if lot was sold and get last price and ER
         if np.isnan(df_lot["Price per share: Sale"][lot]):
-            price_aquisition = df_lot["Price per share: Acquisition"][lot]
-            cost_aquisition = df_lot["Cost: Acquisition"][lot]
             part_1_dict["Number of Shares"] = (
-                part_1_dict["Number of Shares"] + cost_aquisition / price_aquisition
+                part_1_dict["Number of Shares"] + df_lot["Number of shares"][lot]
             )
 
     last_er = df_eoy[df_eoy["Year"] == current_year]["Exchange Rate"].values[0]
@@ -130,11 +136,10 @@ def add_part_4(c, coordinates, df_lot, df_eoy, lot, current_year):
     etf_dict = {}
     # Get info about origianl aquisition
     year_of_aqiusition = df_lot["Date: Acquisition"][lot].year
-    price_aquisition = df_lot["Price per share: Acquisition"][lot]
     cost_aquisition = df_lot["Cost: Acquisition"][lot]
     er_of_aqiusition = df_lot["Exchange Rate: Acquisition"][lot]
 
-    number_of_shares = cost_aquisition / price_aquisition
+    number_of_shares = df_lot["Number of shares"][lot]
     original_basis = cost_aquisition / er_of_aqiusition
 
     logging.debug(

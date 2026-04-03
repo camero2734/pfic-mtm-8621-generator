@@ -8,7 +8,7 @@ coordinate_dict = {
     "Type of Shareholder": (196, 627),  # type of shareholder
     # PFIC info
     "PFIC Name": (36, 567),  # PFIC
-    "PFIC Address": (36, 530),  # PFIC address
+    "PFIC Address": (36, 543),  # PFIC address
     "PFIC Reference ID": (361, 543),  # PFIC ref id
     "PFIC Share Class": (281, 470),  # Descrition of each class of shares
     # PART I
