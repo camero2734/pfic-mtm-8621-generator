@@ -324,6 +324,13 @@ def read_inputs():
     data_dict["Tax year"] = input("📅 Tax year (last two digits): ")
     data_dict["Type of Shareholder"] = CHECKMARK  # assuming always an individual
 
+    output_format = (
+        input("📄 Output format — [P]DF (default) or [T]XT for tax software entry: ")
+        .strip()
+        .lower()
+    )
+    data_dict["output_format"] = "txt" if output_format in ("t", "txt") else "pdf"
+
     # Placeholder values:
     # data_dict['Name of shareholder'] = 'John Doe'
     # data_dict['Identifying Number'] = '123-45-6789'
@@ -335,6 +342,160 @@ def read_inputs():
     files = glob.glob("inputs/*.xlsx")
 
     return data_dict, files
+
+
+def generate_text_output(path: str, data_dict: dict, xlsx: str):
+    """
+    Generate a plain-text summary of Form 8621 fields, suitable for
+    manual entry into tax software.  Returns (number_of_lots, pfic_summary)
+    matching the same contract as create_overlay().
+    """
+    tax_year = 2000 + int(data_dict["Tax year"])
+    df_lot = pd.read_excel(xlsx, sheet_name="Lot Details")
+    df_eoy = pd.read_excel(xlsx, sheet_name="EOY Details")
+    df_pfic = pd.read_excel(xlsx, sheet_name="PFIC Details")
+    number_of_lots = len(df_lot.index)
+
+    pfic_summary = {"ordinary_gains": 0, "ordinary_losses": 0, "capital_losses": 0}
+    lines = []
+
+    # ── Header / personal info ──────────────────────────────────────────────
+    lines.append("=" * 60)
+    lines.append("FORM 8621 — Mark-to-Market Election")
+    lines.append("=" * 60)
+    lines.append(f"Name of shareholder  : {data_dict['Name of shareholder']}")
+    lines.append(f"Identifying Number   : {data_dict['Identifying Number']}")
+    lines.append(f"Address              : {data_dict['Address']}")
+    lines.append(f"City/State/Zip       : {data_dict['City, State, Zip, Country']}")
+    lines.append(f"Tax year             : 20{data_dict['Tax year']}")
+    lines.append(f"Type of shareholder  : Individual")
+    lines.append("")
+
+    # ── PFIC info ───────────────────────────────────────────────────────────
+    lines.append("── PFIC Information ──")
+    lines.append(f"PFIC Name            : {df_pfic['PFIC Name'].values[0]}")
+    lines.append(f"PFIC Address         : {df_pfic['PFIC Address'].values[0]}")
+    lines.append(f"PFIC Reference ID    : {df_pfic['PFIC Reference ID'].values[0]}")
+    lines.append(f"Share Class          : {df_pfic['PFIC Share Class'].values[0]}")
+    lines.append("")
+
+    # ── Part I ──────────────────────────────────────────────────────────────
+    lines.append("── Part I — PFIC Information ──")
+    total_unsold_shares = 0
+    date_of_acq = (
+        pd.to_datetime(df_lot["Date: Acquisition"].values[0]).strftime("%Y-%m-%d")
+        if len(df_lot.index) == 1
+        else "Multiple"
+    )
+    for lot in range(len(df_lot.index)):
+        if np.isnan(df_lot["Price per share: Sale"][lot]):
+            total_unsold_shares += df_lot["Number of shares"][lot]
+
+    last_er = df_eoy[df_eoy["Year"] == tax_year]["Exchange Rate"].values[0]
+    last_price = df_eoy[df_eoy["Year"] == tax_year]["Price"].values[0]
+    fmv_total = round(total_unsold_shares * last_price / last_er)
+
+    lines.append(f"Date of Acquisition  : {date_of_acq}")
+    lines.append(f"Number of Shares     : {total_unsold_shares}")
+    lines.append(f"FMV (line 1f / §1296): ${fmv_total}")
+    lines.append(f"Part II election     : Mark-to-Market (checked)")
+    lines.append("")
+
+    # ── Part IV — one block per lot ─────────────────────────────────────────
+    actual_lots = 0
+    for lot in range(number_of_lots):
+        year_of_acquisition = df_lot["Date: Acquisition"][lot].year
+        cost_acquisition = df_lot["Cost: Acquisition"][lot]
+        er_of_acquisition = df_lot["Exchange Rate: Acquisition"][lot]
+        num_shares = df_lot["Number of shares"][lot]
+        original_basis = cost_acquisition / er_of_acquisition
+
+        if tax_year > year_of_acquisition:
+            prev_er = df_eoy[df_eoy["Year"] == tax_year - 1]["Exchange Rate"].values[0]
+            prev_price = df_eoy[df_eoy["Year"] == tax_year - 1]["Price"].values[0]
+            adjusted_basis = round(num_shares * prev_price / prev_er)
+        else:
+            adjusted_basis = round(original_basis)
+
+        lot_summary = {"ordinary_gains": 0, "ordinary_losses": 0, "capital_losses": 0}
+
+        if np.isnan(df_lot["Price per share: Sale"][lot]):
+            # Unsold lot
+            lot_er = df_eoy[df_eoy["Year"] == tax_year]["Exchange Rate"].values[0]
+            lot_price = df_eoy[df_eoy["Year"] == tax_year]["Price"].values[0]
+            fmv = round(num_shares * lot_price / lot_er)
+            gain_loss = fmv - adjusted_basis
+
+            lines.append(f"── Part IV — Lot {actual_lots + 1} (held at year-end) ──")
+            lines.append(f"  10a  FMV at year-end          : ${fmv}")
+            lines.append(f"  10b  Adjusted basis            : ${adjusted_basis}")
+            lines.append(f"  10c  Gain / (Loss) [10a - 10b] : ${gain_loss}")
+
+            if gain_loss < 0:
+                if adjusted_basis > original_basis:
+                    unreversed = round(adjusted_basis - original_basis)
+                    ordinary_loss = -min(unreversed, -gain_loss)
+                    lines.append(f"  11   Unreversed inclusions    : ${unreversed}")
+                    lines.append(f"  12   Ordinary loss             : ${ordinary_loss}")
+                    lot_summary["ordinary_losses"] += abs(ordinary_loss)
+                else:
+                    lines.append(f"  11   Unreversed inclusions    : $0")
+                    lines.append(
+                        f"  12   Ordinary loss             : $0  (non-deductible)"
+                    )
+            else:
+                lines.append(f"  11   Unreversed inclusions    : (n/a)")
+                lines.append(f"  12   Ordinary loss             : (n/a)")
+                lot_summary["ordinary_gains"] += gain_loss
+
+        else:
+            # Sold lot
+            sale_er = df_lot["Exchange Rate: Sale"][lot]
+            sale_price = df_lot["Price per share: Sale"][lot]
+            year_of_sale = df_lot["Date: Sale"][lot].year
+            if year_of_sale < tax_year:
+                number_of_lots -= 1
+                continue
+            proceeds = round(num_shares * sale_price / sale_er)
+            sale_gain_loss = proceeds - adjusted_basis
+
+            lines.append(f"── Part IV — Lot {actual_lots + 1} (sold in {tax_year}) ──")
+            lines.append(f"  13a  Sale proceeds              : ${proceeds}")
+            lines.append(f"  13b  Adjusted basis at sale     : ${adjusted_basis}")
+            lines.append(f"  13c  Gain / (Loss) [13a - 13b]  : ${sale_gain_loss}")
+
+            if sale_gain_loss < 0:
+                if adjusted_basis > original_basis:
+                    unreversed = round(adjusted_basis - original_basis)
+                    ordinary_loss = -min(unreversed, -sale_gain_loss)
+                    lines.append(f"  14a  Unreversed inclusions    : ${unreversed}")
+                    lines.append(f"  14b  Ordinary loss             : ${ordinary_loss}")
+                    lines.append(f"  14c  Capital loss              : (n/a)")
+                    lot_summary["ordinary_losses"] += abs(ordinary_loss)
+                else:
+                    capital_loss = sale_gain_loss
+                    lines.append(f"  14a  Unreversed inclusions    : $0")
+                    lines.append(f"  14b  Ordinary loss             : $0")
+                    lines.append(f"  14c  Capital loss              : ${capital_loss}")
+                    lot_summary["capital_losses"] += abs(capital_loss)
+            else:
+                lines.append(f"  14a  Unreversed inclusions    : (n/a)")
+                lines.append(f"  14b  Ordinary loss             : (n/a)")
+                lines.append(f"  14c  Capital loss              : (n/a)")
+                lot_summary["ordinary_gains"] += sale_gain_loss
+
+        lines.append("")
+        actual_lots += 1
+        pfic_summary["ordinary_gains"] += lot_summary["ordinary_gains"]
+        pfic_summary["ordinary_losses"] += lot_summary["ordinary_losses"]
+        pfic_summary["capital_losses"] += lot_summary["capital_losses"]
+
+    number_of_lots = actual_lots
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+
+    return number_of_lots, pfic_summary
 
 
 def main():
@@ -366,19 +527,25 @@ def main():
             file_name = file.split("/")[-1].split(".")[0]
             logging.info(f"📂 Processing PFIC: {file_name}")
 
-            FORM_FULL_PATH = f"{OUTPUT_FOLDER}{file_name}_full.pdf"
-            FORM_OVERLAY_PATH = f"{OUTPUT_FOLDER}{file_name}_overlay.pdf"
-            FORM_OUTPUT_PATH = f"{OUTPUT_FOLDER}{file_name}.pdf"
+            if data_dict["output_format"] == "txt":
+                FORM_OUTPUT_PATH = f"{OUTPUT_FOLDER}{file_name}.txt"
+                number_of_lots, pfic_summary = generate_text_output(
+                    path=FORM_OUTPUT_PATH, data_dict=data_dict, xlsx=file
+                )
+            else:
+                FORM_FULL_PATH = f"{OUTPUT_FOLDER}{file_name}_full.pdf"
+                FORM_OVERLAY_PATH = f"{OUTPUT_FOLDER}{file_name}_overlay.pdf"
+                FORM_OUTPUT_PATH = f"{OUTPUT_FOLDER}{file_name}.pdf"
 
-            number_of_lots, pfic_summary = create_overlay(
-                path=FORM_OVERLAY_PATH, data_dict=data_dict, xlsx=file
-            )
-            create_full_8621(form, number_of_lots, FORM_FULL_PATH)
-            merge_pdfs(FORM_FULL_PATH, FORM_OVERLAY_PATH, FORM_OUTPUT_PATH)
+                number_of_lots, pfic_summary = create_overlay(
+                    path=FORM_OVERLAY_PATH, data_dict=data_dict, xlsx=file
+                )
+                create_full_8621(form, number_of_lots, FORM_FULL_PATH)
+                merge_pdfs(FORM_FULL_PATH, FORM_OVERLAY_PATH, FORM_OUTPUT_PATH)
 
-            # Delete intermediate files
-            os.remove(FORM_FULL_PATH)
-            os.remove(FORM_OVERLAY_PATH)
+                # Delete intermediate files
+                os.remove(FORM_FULL_PATH)
+                os.remove(FORM_OVERLAY_PATH)
 
             # Add to total summary
             total_summary["ordinary_gains"] += pfic_summary["ordinary_gains"]
