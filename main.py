@@ -1,19 +1,296 @@
 import pdfrw
-from reportlab.pdfgen import canvas
 import pandas as pd
 import numpy as np
 import glob
 import os
-from f8621_xy_coordinates import get_coordinates
 import logging
 
-CHECKMARK = "\u2713"
+# Value written into a checkbox field to mark it checked
+CHECKED = pdfrw.PdfObject("/1")
 
 
-def create_overlay(path: str, data_dict: dict, xlsx: str):
+# ---------------------------------------------------------------------------
+# AcroForm field name constants (as they appear in f8621.pdf widget /T keys)
+# ---------------------------------------------------------------------------
+
+# Page 1 – personal info
+F_NAME = "f1_1[0]"  # Name of shareholder
+F_ADDRESS_1 = "f1_2[0]"  # Street address line 1
+F_ADDRESS_2 = "f1_3[0]"  # Street address line 2 (city/state/zip overflow)
+F_CITY_STATE_ZIP = "f1_4[0]"  # City, state, zip
+F_TAX_YEAR = "f1_9[0]"  # 2-digit tax year (top-right corner)
+F_IDENTIFYING_NUM = "f1_8[0]"  # SSN / EIN
+
+# Page 1 – shareholder type checkboxes (c1_1[0..5] = individual/partnership/S-corp/trust/estate/other)
+C_SHAREHOLDER_INDIVIDUAL = "c1_1[0]"
+
+# Page 1 – PFIC info
+F_PFIC_NAME = "f1_14[0]"  # Name of PFIC
+F_PFIC_ADDRESS = "f1_15[0]"  # Address of PFIC (multi-line field)
+F_PFIC_REF_ID = "f1_17[0]"  # Reference ID number of PFIC
+F_PFIC_SHARE_CLASS = "f1_23[0]"  # Description of each class of shares
+
+# Page 1 – Part I
+F_DATE_ACQUISITION = "f1_24[0]"  # Date of acquisition
+F_NUM_SHARES = "f1_25[0]"  # Number of shares
+F_AMOUNT_1291 = "f1_27[0]"  # Amount subject to section 1291
+F_AMOUNT_1293 = "f1_28[0]"  # Amount subject to section 1293
+F_AMOUNT_1296 = "f1_29[0]"  # Amount subject to section 1296
+
+# Page 1 – Part I value-of-PFIC checkboxes (≤$50k / $50k–$100k / $100k–$150k / $150k–$200k)
+C_VALUE_LE_50K = "c1_5[0]"
+C_VALUE_50_100K = "c1_5[1]"
+C_VALUE_100_150K = "c1_5[2]"
+C_VALUE_150_200K = "c1_5[3]"
+F_VALUE_OVER_200K = "f1_26[0]"  # free-text field for values > $200k
+
+# Page 1 – Part I section type c checkbox
+C_SECTION_TYPE_C = "c1_8[0]"
+
+# Page 1 – Part II (MTM election)
+C_PART2_MTM = "c1_11[0]"
+
+# Page 2 – Part IV (MTM annual calculations, one page per lot)
+F_10A = "f2_15[0]"  # FMV at year-end
+F_10B = "f2_16[0]"  # Adjusted basis at year-end
+F_10C = "f2_17[0]"  # Gain (loss) from line 10a - 10b
+F_11 = "f2_18[0]"  # Unreversed inclusions (holding)
+F_12 = "f2_19[0]"  # Ordinary loss limited by line 11 (holding)
+F_13A = "f2_20[0]"  # Sale proceeds
+F_13B = "f2_21[0]"  # Adjusted basis at date of sale
+F_13C = "f2_22[0]"  # Gain (loss) from line 13a - 13b
+F_14A = "f2_23[0]"  # Unreversed inclusions (sale)
+F_14B = "f2_24[0]"  # Ordinary loss limited by line 14a (sale)
+F_14C = "f2_25[0]"  # Capital loss (sale, basis ≤ original)
+
+
+# ---------------------------------------------------------------------------
+# PDF helpers
+# ---------------------------------------------------------------------------
+
+
+def _fill_fields(pdf: pdfrw.PdfReader, fields: dict[str, str], page_index: int) -> None:
+    """Write *fields* (field_name -> value) into widget annotations on *page_index*."""
+    page = pdf.pages[page_index]
+    annotations = page.Annots
+    if not annotations:
+        return
+    for annot in annotations:
+        if annot.Subtype != "/Widget":
+            continue
+        raw_t = annot.T
+        if not raw_t:
+            continue
+        # Decode UTF-16-BE field name
+        s = str(raw_t).strip("<>")
+        try:
+            name = bytes.fromhex(s).decode("utf-16-be").lstrip("\ufeff")
+        except Exception:
+            name = str(raw_t)
+        if name in fields:
+            annot.update(pdfrw.PdfDict(V=fields[name], AP=""))
+
+
+def fill_pdf(
+    input_path: str, output_path: str, page_fields: list[dict[str, str]]
+) -> None:
     """
-    Create the data that will be overlayed on top
-    of the form that we want to fill
+    Fill *input_path* and write to *output_path*.
+
+    *page_fields* is a list of dicts, one per PDF page (0-indexed).
+    Each dict maps AcroForm field names to string values (or PdfObjects for checkboxes).
+    """
+    pdf = pdfrw.PdfReader(input_path)
+    for page_index, fields in enumerate(page_fields):
+        if fields:
+            _fill_fields(pdf, fields, page_index)
+    pdf.Root.AcroForm.update(pdfrw.PdfDict(NeedAppearances=pdfrw.PdfObject("true")))
+    pdfrw.PdfWriter().write(output_path, pdf)
+
+
+# ---------------------------------------------------------------------------
+# Form section builders  (return dicts of field_name -> value)
+# ---------------------------------------------------------------------------
+
+
+def _personal_info_fields(data_dict: dict) -> dict:
+    return {
+        F_NAME: data_dict["Name of shareholder"],
+        F_ADDRESS_1: data_dict["Address"],
+        F_CITY_STATE_ZIP: data_dict["City, State, Zip, Country"],
+        F_IDENTIFYING_NUM: data_dict["Identifying Number"],
+        F_TAX_YEAR: data_dict["Tax year"],
+        C_SHAREHOLDER_INDIVIDUAL: CHECKED,  # always individual
+    }
+
+
+def _pfic_info_fields(df_pfic: pd.DataFrame) -> dict:
+    return {
+        F_PFIC_NAME: str(df_pfic["PFIC Name"].values[0]),
+        F_PFIC_ADDRESS: str(df_pfic["PFIC Address"].values[0]),
+        F_PFIC_REF_ID: str(df_pfic["PFIC Reference ID"].values[0]),
+        F_PFIC_SHARE_CLASS: str(df_pfic["PFIC Share Class"].values[0]),
+    }
+
+
+def _part1_fields(
+    df_lot: pd.DataFrame, df_eoy: pd.DataFrame, current_year: int
+) -> dict:
+    date_of_acq = (
+        pd.to_datetime(df_lot["Date: Acquisition"].values[0]).strftime("%Y-%m-%d")
+        if len(df_lot.index) == 1
+        else "Multiple"
+    )
+    unsold_shares = 0
+    for lot in range(len(df_lot.index)):
+        if np.isnan(df_lot["Price per share: Sale"][lot]):
+            unsold_shares += df_lot["Number of shares"][lot]
+
+    last_er = df_eoy[df_eoy["Year"] == current_year]["Exchange Rate"].values[0]
+    last_price = df_eoy[df_eoy["Year"] == current_year]["Price"].values[0]
+    value_of_pfic = round(unsold_shares * last_price / last_er)
+
+    fields = {
+        F_DATE_ACQUISITION: str(date_of_acq),
+        F_NUM_SHARES: str(unsold_shares),
+        F_AMOUNT_1291: "",
+        F_AMOUNT_1293: "",
+        F_AMOUNT_1296: str(value_of_pfic),
+        C_SECTION_TYPE_C: CHECKED,
+        C_PART2_MTM: CHECKED,
+    }
+
+    # Value-of-PFIC checkboxes
+    if 0 <= value_of_pfic <= 50_000:
+        fields[C_VALUE_LE_50K] = CHECKED
+    elif value_of_pfic <= 100_000:
+        fields[C_VALUE_50_100K] = CHECKED
+    elif value_of_pfic <= 150_000:
+        fields[C_VALUE_100_150K] = CHECKED
+    elif value_of_pfic <= 200_000:
+        fields[C_VALUE_150_200K] = CHECKED
+    else:
+        fields[F_VALUE_OVER_200K] = str(value_of_pfic)
+
+    return fields
+
+
+def _part4_fields(
+    df_lot: pd.DataFrame, df_eoy: pd.DataFrame, lot: int, current_year: int
+):
+    """
+    Returns (fields_dict, lot_summary) for one lot, or (None, lot_summary) if the lot
+    should be skipped (sold in a prior year).
+    """
+    lot_summary = {"ordinary_gains": 0, "ordinary_losses": 0, "capital_losses": 0}
+
+    year_of_acquisition = df_lot["Date: Acquisition"][lot].year
+    cost_acquisition = df_lot["Cost: Acquisition"][lot]
+    er_of_acquisition = df_lot["Exchange Rate: Acquisition"][lot]
+    num_shares = df_lot["Number of shares"][lot]
+    original_basis = cost_acquisition / er_of_acquisition
+
+    if current_year > year_of_acquisition:
+        prev_er = df_eoy[df_eoy["Year"] == current_year - 1]["Exchange Rate"].values[0]
+        prev_price = df_eoy[df_eoy["Year"] == current_year - 1]["Price"].values[0]
+        adjusted_basis = round(num_shares * prev_price / prev_er)
+    else:
+        adjusted_basis = round(original_basis)
+
+    fields = {}
+
+    if np.isnan(df_lot["Price per share: Sale"][lot]):
+        # Holding at year-end
+        logging.info(f"    📈 Lot {lot + 1}: No sale (holding position)")
+        last_er = df_eoy[df_eoy["Year"] == current_year]["Exchange Rate"].values[0]
+        last_price = df_eoy[df_eoy["Year"] == current_year]["Price"].values[0]
+        fmv = round(num_shares * last_price / last_er)
+
+        fields[F_10A] = str(fmv)
+        fields[F_10B] = str(adjusted_basis)
+        fields[F_10C] = str(fmv - adjusted_basis)
+
+        gain_loss = fmv - adjusted_basis
+        if gain_loss < 0:
+            if adjusted_basis > original_basis:
+                unreversed = round(adjusted_basis - original_basis)
+                ordinary_loss = -min(unreversed, -gain_loss)
+                fields[F_11] = str(unreversed)
+                fields[F_12] = str(ordinary_loss)
+                logging.info(
+                    f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(ordinary_loss)}"
+                )
+                lot_summary["ordinary_losses"] += abs(ordinary_loss)
+            else:
+                logging.info(
+                    f"    📉 Lot {lot + 1}: Unrecognizable loss of ${abs(gain_loss)}"
+                )
+                fields[F_11] = "0"
+                fields[F_12] = "0"
+        else:
+            fields[F_11] = ""
+            fields[F_12] = ""
+            logging.info(f"    📈 Lot {lot + 1}: Ordinary gain of ${gain_loss}")
+            lot_summary["ordinary_gains"] += gain_loss
+
+        fields.update(
+            {F_13A: "", F_13B: "", F_13C: "", F_14A: "", F_14B: "", F_14C: ""}
+        )
+
+    else:
+        # Sold lot
+        logging.info(f"    💰 Lot {lot + 1}: Sale detected")
+        last_er = df_lot["Exchange Rate: Sale"][lot]
+        last_price = df_lot["Price per share: Sale"][lot]
+        year_of_sale = df_lot["Date: Sale"][lot].year
+        if year_of_sale < current_year:
+            return None, lot_summary
+        proceeds = round(num_shares * last_price / last_er)
+        sale_gain_loss = proceeds - adjusted_basis
+
+        fields[F_13A] = str(proceeds)
+        fields[F_13B] = str(adjusted_basis)
+        fields[F_13C] = str(sale_gain_loss)
+
+        if sale_gain_loss < 0:
+            if adjusted_basis > original_basis:
+                unreversed = round(adjusted_basis - original_basis)
+                ordinary_loss = -min(unreversed, -sale_gain_loss)
+                fields[F_14A] = str(unreversed)
+                fields[F_14B] = str(ordinary_loss)
+                fields[F_14C] = ""
+                logging.info(
+                    f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(ordinary_loss)}"
+                )
+                lot_summary["ordinary_losses"] += abs(ordinary_loss)
+            else:
+                capital_loss = sale_gain_loss
+                fields[F_14A] = "0"
+                fields[F_14B] = "0"
+                fields[F_14C] = str(capital_loss)
+                logging.info(
+                    f"    📉 Lot {lot + 1}: Capital loss of ${abs(capital_loss)}"
+                )
+                lot_summary["capital_losses"] += abs(capital_loss)
+        else:
+            fields.update({F_14A: "", F_14B: "", F_14C: ""})
+            logging.info(f"    📈 Lot {lot + 1}: Ordinary gain of ${sale_gain_loss}")
+            lot_summary["ordinary_gains"] += sale_gain_loss
+
+        fields.update({F_10A: "", F_10B: "", F_10C: "", F_11: "", F_12: ""})
+
+    return fields, lot_summary
+
+
+# ---------------------------------------------------------------------------
+# Main PDF generation
+# ---------------------------------------------------------------------------
+
+
+def create_filled_pdf(output_path: str, data_dict: dict, xlsx: str):
+    """
+    Build and save a filled Form 8621 PDF directly via AcroForm fields.
+    Returns (number_of_lots, pfic_summary).
     """
     tax_year = 2000 + int(data_dict["Tax year"])
     df_lot = pd.read_excel(xlsx, sheet_name="Lot Details")
@@ -22,333 +299,120 @@ def create_overlay(path: str, data_dict: dict, xlsx: str):
     number_of_lots = len(df_lot.index)
     logging.info(f"  📊 Found {number_of_lots} lots to process")
     logging.debug(f"  📊 Lot details dataframe:\n{df_lot}")
-    c = canvas.Canvas(path)
-    coordinates = get_coordinates()
-    add_personal_info(c, coordinates, data_dict)
-    add_pfic_info(c, coordinates, df_pfic)
-    add_part_1(c, coordinates, df_lot, df_eoy, tax_year)
-    add_part_2(c, coordinates, data_dict)
 
-    # Track gains and losses for this PFIC
+    print(df_pfic)
+
     pfic_summary = {"ordinary_gains": 0, "ordinary_losses": 0, "capital_losses": 0}
+
+    # Page 0 (page 1 of the form) – fixed fields
+    page0_fields: dict = {}
+    page0_fields.update(_personal_info_fields(data_dict))
+    page0_fields.update(_pfic_info_fields(df_pfic))
+    page0_fields.update(_part1_fields(df_lot, df_eoy, tax_year))
+
+    # Page 1 (page 2 of the form) – one set of Part IV fields per lot
+    # The form only has one page 2; for multiple lots we need multiple copies.
+    # We build a list of per-lot field dicts and then assemble a multi-page PDF.
+    lot_pages: list[dict] = []
+    actual_lots = 0
 
     for lot in range(number_of_lots):
         logging.info(f"  🔄 Processing lot {lot + 1}/{number_of_lots}")
-        result = add_part_4(c, coordinates, df_lot, df_eoy, lot, tax_year)
-        if isinstance(result, tuple):
-            processed, lot_summary = result
-            if not processed:
-                logging.info(f"    ⏭️ Skipping lot {lot + 1} (sale in different year)")
-                number_of_lots = number_of_lots - 1
-            else:
-                # Add to PFIC summary
-                pfic_summary["ordinary_gains"] += lot_summary.get("ordinary_gains", 0)
-                pfic_summary["ordinary_losses"] += lot_summary.get("ordinary_losses", 0)
-                pfic_summary["capital_losses"] += lot_summary.get("capital_losses", 0)
-        else:
-            if not result:
-                logging.info(f"    ⏭️ Skipping lot {lot + 1} (sale in different year)")
-                number_of_lots = number_of_lots - 1
+        fields, lot_summary = _part4_fields(df_lot, df_eoy, lot, tax_year)
+        if fields is None:
+            logging.info(f"    ⏭️ Skipping lot {lot + 1} (sale in different year)")
+            continue
+        lot_pages.append(fields)
+        actual_lots += 1
+        pfic_summary["ordinary_gains"] += lot_summary["ordinary_gains"]
+        pfic_summary["ordinary_losses"] += lot_summary["ordinary_losses"]
+        pfic_summary["capital_losses"] += lot_summary["capital_losses"]
 
-    c.save()
-    return number_of_lots, pfic_summary
-
-
-def add_personal_info(c, coordinates, data_dict):
-    keys = [
-        "Name of shareholder",
-        "Identifying Number",
-        "Address",
-        "City, State, Zip, Country",
-        "Tax year",
-        "Type of Shareholder",
-    ]
-    for key in keys:
-        c.drawString(coordinates[key][0], coordinates[key][1], data_dict[key])
-
-    c.drawString(196, 627, CHECKMARK)  # type of shareholder
-
-
-def add_pfic_info(c, coordinates, df_pfic: pd.DataFrame):
-    print(df_pfic)
-    keys = ["PFIC Name", "PFIC Address", "PFIC Reference ID", "PFIC Share Class"]
-    for key in keys:
-        value = df_pfic[key].values[0]
-        if key == "PFIC Address" and isinstance(value, str) and "\n" in value:
-            lines = value.split("\n")
-            y = coordinates[key][1]
-            for line in lines:
-                c.drawString(coordinates[key][0], y, line)
-                y -= 12
-        else:
-            c.drawString(coordinates[key][0], coordinates[key][1], value)
-
-
-def add_part_1(c, coordinates, df_lot, df_eoy, current_year):
-    part_1_dict = {}
-    part_1_dict["Date of Acquisition"] = (
-        pd.to_datetime(df_lot["Date: Acquisition"].values[0]).strftime("%Y-%m-%d")
-        if len(df_lot.index) == 1
-        else "Multiple"
-    )
-    part_1_dict["Number of Shares"] = 0
-    part_1_dict["Amount of 1291"] = ""
-    part_1_dict["Amount of 1293"] = ""
-    for lot in range(len(df_lot.index)):
-        # Check if lot was sold and get last price and ER
-        if np.isnan(df_lot["Price per share: Sale"][lot]):
-            part_1_dict["Number of Shares"] = (
-                part_1_dict["Number of Shares"] + df_lot["Number of shares"][lot]
-            )
-
-    last_er = df_eoy[df_eoy["Year"] == current_year]["Exchange Rate"].values[0]
-    last_price = df_eoy[df_eoy["Year"] == current_year]["Price"].values[0]
-    part_1_dict["Amount of 1296"] = round(
-        part_1_dict["Number of Shares"] * last_price / last_er
+    # Build a PDF with page 1 followed by one copy of page 2 per lot
+    _assemble_and_fill(
+        template_path="f8621.pdf",
+        output_path=output_path,
+        page0_fields=page0_fields,
+        lot_pages=lot_pages,
     )
 
-    for key in part_1_dict.keys():
-        c.drawString(
-            coordinates[key][0], coordinates[key][1], "{}".format(part_1_dict[key])
-        )
-
-    value_of_pfic = part_1_dict["Amount of 1296"]
-    if (value_of_pfic >= 0) and (value_of_pfic <= 50000):
-        c.drawString(79.2, 373.5, CHECKMARK)  # value of pfic
-    elif (value_of_pfic > 50000) and (value_of_pfic <= 100000):
-        c.drawString(151.2, 373.5, CHECKMARK)  # value of pfic
-    elif (value_of_pfic > 100000) and (value_of_pfic <= 150000):
-        c.drawString(245, 373.5, CHECKMARK)  # value of pfic
-    elif (value_of_pfic > 150000) and (value_of_pfic <= 200000):
-        c.drawString(345.6, 373.5, CHECKMARK)  # value of pfic
-    else:
-        c.drawString(199, 362, "{}".format(value_of_pfic))  # value of pfic
-
-    # Check marks
-    c.drawString(79.2, 290, CHECKMARK)  # type of PFIC type c
+    return actual_lots, pfic_summary
 
 
-def add_part_2(c, coordinates, data_dict):
-    c.drawString(52.4, 205.5, CHECKMARK)  # Part II election to MTM PFIC stock
-
-
-def add_part_4(c, coordinates, df_lot, df_eoy, lot, current_year):
-    etf_dict = {}
-    # Get info about origianl aquisition
-    year_of_aqiusition = df_lot["Date: Acquisition"][lot].year
-    cost_aquisition = df_lot["Cost: Acquisition"][lot]
-    er_of_aqiusition = df_lot["Exchange Rate: Acquisition"][lot]
-
-    number_of_shares = df_lot["Number of shares"][lot]
-    original_basis = cost_aquisition / er_of_aqiusition
-
-    logging.debug(
-        f"    📊 Lot {lot + 1} details - Shares: {number_of_shares:.2f}, Original basis: ${original_basis:.2f}"
-    )
-
-    # Get last year's basis
-    if current_year > year_of_aqiusition:
-        prev_year_er = df_eoy[df_eoy["Year"] == current_year - 1][
-            "Exchange Rate"
-        ].values[0]
-        prev_year_price = df_eoy[df_eoy["Year"] == current_year - 1]["Price"].values[0]
-        adjusted_basis = round(number_of_shares * prev_year_price / prev_year_er)
-    else:
-        adjusted_basis = round(original_basis)
-
-    # Track gains/losses for this lot
-    lot_summary = {"ordinary_gains": 0, "ordinary_losses": 0, "capital_losses": 0}
-
-    # Check if lot was sold and get last price and ER
-    if np.isnan(df_lot["Price per share: Sale"][lot]):
-        logging.info(f"    📈 Lot {lot + 1}: No sale (holding position)")
-        last_er = df_eoy[df_eoy["Year"] == current_year]["Exchange Rate"].values[0]
-        last_price = df_eoy[df_eoy["Year"] == current_year]["Price"].values[0]
-        fmv_dollars = round(number_of_shares * last_price / last_er)
-        logging.debug(f"    💱 Exchange rate: {last_er}, Price: ${last_price}")
-        logging.debug(f"    💰 FMV: ${fmv_dollars}, Adjusted basis: ${adjusted_basis}")
-
-        etf_dict["10a"] = fmv_dollars
-        etf_dict["10b"] = adjusted_basis
-        etf_dict["10c"] = etf_dict["10a"] - etf_dict["10b"]
-        if etf_dict["10c"] < 0:
-            if adjusted_basis > original_basis:
-                unreversed_inclusions = round(adjusted_basis - original_basis)
-                if unreversed_inclusions > (-1 * etf_dict["10c"]):
-                    loss_from_ten_c = etf_dict["10c"]
-                else:
-                    loss_from_ten_c = -1 * unreversed_inclusions
-                etf_dict["11"] = unreversed_inclusions
-                etf_dict["12"] = loss_from_ten_c
-                logging.info(
-                    f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(etf_dict['12'])}"
-                )
-                lot_summary["ordinary_losses"] += abs(etf_dict["12"])
-            else:
-                logging.info(
-                    f"    📉 Lot {lot + 1}: Unrecognizable loss of ${abs(etf_dict['10c'])}"
-                )
-                etf_dict["11"] = "0"
-                etf_dict["12"] = "0"
-        else:
-            etf_dict["11"] = ""
-            etf_dict["12"] = ""
-            logging.info(f"    📈 Lot {lot + 1}: Ordinary gain of ${etf_dict['10c']}")
-            lot_summary["ordinary_gains"] += etf_dict["10c"]
-        etf_dict["13a"] = ""
-        etf_dict["13b"] = ""
-        etf_dict["13c"] = ""
-        etf_dict["14a"] = ""
-        etf_dict["14b"] = ""
-        etf_dict["14c"] = ""
-
-    else:
-        logging.info(f"    💰 Lot {lot + 1}: Sale detected")
-        last_er = df_lot["Exchange Rate: Sale"][lot]
-        last_price = df_lot["Price per share: Sale"][lot]
-        year_of_sale = df_lot["Date: Sale"][lot].year
-        if year_of_sale < current_year:
-            return False, lot_summary
-        fmv_dollars = round(number_of_shares * last_price / last_er)
-        logging.debug(
-            f"    💱 Sale exchange rate: {last_er}, Sale price: ${last_price}"
-        )
-        logging.debug(
-            f"    💰 Sale proceeds: ${fmv_dollars}, Adjusted basis: ${adjusted_basis}"
-        )
-        etf_dict["13a"] = round(fmv_dollars)
-        etf_dict["13b"] = round(adjusted_basis)
-        etf_dict["13c"] = etf_dict["13a"] - etf_dict["13b"]
-        if etf_dict["13c"] < 0:
-            if adjusted_basis > original_basis:
-                unreversed_inclusions = round(adjusted_basis - original_basis)
-                if unreversed_inclusions > (-1 * etf_dict["13c"]):
-                    loss_from_thirteen_c = etf_dict["13c"]
-                else:
-                    loss_from_thirteen_c = -1 * unreversed_inclusions
-                etf_dict["14a"] = unreversed_inclusions
-                etf_dict["14b"] = loss_from_thirteen_c
-                etf_dict["14c"] = ""
-                logging.info(
-                    f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(etf_dict['14b'])}"
-                )
-                lot_summary["ordinary_losses"] += abs(etf_dict["14b"])
-            else:
-                etf_dict["14a"] = 0
-                etf_dict["14b"] = 0
-                etf_dict["14c"] = etf_dict["13c"]
-                logging.info(
-                    f"    📉 Lot {lot + 1}: Capital loss of ${abs(etf_dict['14c'])}"
-                )
-                lot_summary["capital_losses"] += abs(etf_dict["14c"])
-        else:
-            etf_dict["14a"] = ""
-            etf_dict["14b"] = ""
-            etf_dict["14c"] = ""
-            logging.info(f"    📈 Lot {lot + 1}: Ordinary gain of ${etf_dict['13c']}")
-            lot_summary["ordinary_gains"] += etf_dict["13c"]
-
-    c.showPage()
-    for key in etf_dict.keys():
-        if key in coordinates:
-            c.drawString(
-                coordinates[key][0], coordinates[key][1], "{}".format(etf_dict[key])
-            )
-        else:
-            logging.warning(f"    ⚠️ Coordinate missing for {key} in lot {lot + 1}")
-    return True, lot_summary
-
-
-def merge_pdfs(pdf_1, pdf_2, output):
+def _assemble_and_fill(
+    template_path: str,
+    output_path: str,
+    page0_fields: dict,
+    lot_pages: list[dict],
+) -> None:
     """
-    Merge the specified fillable form PDF with the
-    overlay PDF and save the output
+    Assemble a final PDF:
+      - page 1 of the template (filled with page0_fields)
+      - one copy of template page 2 per lot (each filled with the corresponding lot fields)
+
+    We modify the page tree (/Kids, /Count) directly so that the AcroForm dictionary
+    is preserved intact when pdfrw writes the file.
     """
-    form = pdfrw.PdfReader(pdf_1)
-    olay = pdfrw.PdfReader(pdf_2)
+    template = pdfrw.PdfReader(template_path)
 
-    for form_page, overlay_page in zip(form.pages, olay.pages):
-        merge_obj = pdfrw.PageMerge()
-        overlay = merge_obj.add(overlay_page)[0]
-        pdfrw.PageMerge(form_page).add(overlay).render()
+    # Fill page 1 in-place
+    _fill_page(template.pages[0], page0_fields)
 
-    writer = pdfrw.PdfWriter()
-    writer.write(output, form)
+    # Fill the template's own page 2 with the first lot
+    if lot_pages:
+        _fill_page(template.pages[1], lot_pages[0])
 
+    # For additional lots, re-read the template to get fresh independent page copies
+    extra_pages = []
+    for lot_fields in lot_pages[1:]:
+        fresh = pdfrw.PdfReader(template_path)
+        page = fresh.pages[1]
+        _fill_page(page, lot_fields)
+        extra_pages.append(page)
 
-def split(path, page, output):
-    pdf_obj = pdfrw.PdfReader(path)
-    total_pages = len(pdf_obj.pages)
-
-    writer = pdfrw.PdfWriter()
-
-    if page <= total_pages:
-        writer.addpage(pdf_obj.pages[page])
-
-    writer.write(output)
-
-
-def concatenate(paths, output):
-    writer = pdfrw.PdfWriter()
-
-    for path in paths:
-        reader = pdfrw.PdfReader(path)
-        writer.addpages(reader.pages)
-
-    writer.write(output)
-
-
-def create_full_8621(path, number_of_page_2, output):
-    orig_path = path + ".pdf"
-    page_1_path = path + "page1.pdf"
-    page_2_path = path + "page2.pdf"
-    split(orig_path, 0, page_1_path)
-    split(orig_path, 1, page_2_path)
-    concatenate([page_1_path, page_2_path], output)
-    for page in range(number_of_page_2 - 1):
-        concatenate([output, page_2_path], output)
-
-    os.remove(page_1_path)
-    os.remove(page_2_path)
-
-
-def read_inputs():
-    data_dict = {}
-
-    logging.info("📝 First, enter some details:")
-
-    data_dict["Name of shareholder"] = input("👤 Name of shareholder: ")
-    data_dict["Identifying Number"] = input("🆔 Identifying Number (e.g., SSN): ")
-    data_dict["City, State, Zip, Country"] = input("🌍 City, State, Zip, Country: ")
-    data_dict["Address"] = input("🏠 Address: ")
-    data_dict["Tax year"] = input("📅 Tax year (last two digits): ")
-    data_dict["Type of Shareholder"] = CHECKMARK  # assuming always an individual
-
-    output_format = (
-        input("📄 Output format — [P]DF (default) or [T]XT for tax software entry: ")
-        .strip()
-        .lower()
+    # Rebuild the page tree: page 1 + one page 2 per lot (drop template pages 3 & 4)
+    new_kids = (
+        [template.pages[0]] + ([template.pages[1]] if lot_pages else []) + extra_pages
     )
-    data_dict["output_format"] = "txt" if output_format in ("t", "txt") else "pdf"
+    template.Root.Pages.Kids = pdfrw.PdfArray(new_kids)
+    template.Root.Pages.Count = pdfrw.PdfObject(len(new_kids))
 
-    # Placeholder values:
-    # data_dict['Name of shareholder'] = 'John Doe'
-    # data_dict['Identifying Number'] = '123-45-6789'
-    # data_dict['City, State, Zip, Country'] = 'Anytown, ST 12345'
-    # data_dict['Address'] = '123 Main St'
-    # data_dict['Tax year'] = '25'
-    # data_dict['Type of Shareholder'] = '\u2713'  # assuming always an individual
+    template.Root.AcroForm.update(
+        pdfrw.PdfDict(NeedAppearances=pdfrw.PdfObject("true"))
+    )
+    pdfrw.PdfWriter().write(output_path, template)
 
-    files = glob.glob("inputs/*.xlsx")
 
-    return data_dict, files
+def _fill_page(page, fields: dict) -> None:
+    """Fill AcroForm widget annotations on a single page object in-place."""
+    annotations = page.Annots
+    if not annotations:
+        return
+    for annot in annotations:
+        if annot.Subtype != "/Widget":
+            continue
+        raw_t = annot.T
+        if not raw_t:
+            continue
+        s = str(raw_t).strip("<>")
+        try:
+            name = bytes.fromhex(s).decode("utf-16-be").lstrip("\ufeff")
+        except Exception:
+            name = str(raw_t)
+        if name in fields:
+            annot.update(pdfrw.PdfDict(V=fields[name], AP=""))
+
+
+# ---------------------------------------------------------------------------
+# Text output (unchanged logic, kept for --txt mode)
+# ---------------------------------------------------------------------------
 
 
 def generate_text_output(path: str, data_dict: dict, xlsx: str):
     """
     Generate a plain-text summary of Form 8621 fields, suitable for
     manual entry into tax software.  Returns (number_of_lots, pfic_summary)
-    matching the same contract as create_overlay().
+    matching the same contract as create_filled_pdf().
     """
     tax_year = 2000 + int(data_dict["Tax year"])
     df_lot = pd.read_excel(xlsx, sheet_name="Lot Details")
@@ -420,7 +484,6 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
         lot_summary = {"ordinary_gains": 0, "ordinary_losses": 0, "capital_losses": 0}
 
         if np.isnan(df_lot["Price per share: Sale"][lot]):
-            # Unsold lot
             lot_er = df_eoy[df_eoy["Year"] == tax_year]["Exchange Rate"].values[0]
             lot_price = df_eoy[df_eoy["Year"] == tax_year]["Price"].values[0]
             fmv = round(num_shares * lot_price / lot_er)
@@ -449,7 +512,6 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
                 lot_summary["ordinary_gains"] += gain_loss
 
         else:
-            # Sold lot
             sale_er = df_lot["Exchange Rate: Sale"][lot]
             sale_price = df_lot["Price per share: Sale"][lot]
             year_of_sale = df_lot["Date: Sale"][lot].year
@@ -498,12 +560,35 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
     return number_of_lots, pfic_summary
 
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
+
+def read_inputs():
+    data_dict = {}
+
+    logging.info("📝 First, enter some details:")
+
+    data_dict["Name of shareholder"] = input("👤 Name of shareholder: ")
+    data_dict["Identifying Number"] = input("🆔 Identifying Number (e.g., SSN): ")
+    data_dict["City, State, Zip, Country"] = input("🌍 City, State, Zip, Country: ")
+    data_dict["Address"] = input("🏠 Address: ")
+    data_dict["Tax year"] = input("📅 Tax year (last two digits): ")
+
+    output_format = (
+        input("📄 Output format — [P]DF (default) or [T]XT for tax software entry: ")
+        .strip()
+        .lower()
+    )
+    data_dict["output_format"] = "txt" if output_format in ("t", "txt") else "pdf"
+
+    files = glob.glob("inputs/*.xlsx")
+    return data_dict, files
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logging.info("🚀 Form 8621 Filler Initialized")
 
     try:
@@ -514,13 +599,10 @@ def main():
             )
             exit(1)
 
-        form = "f8621"
-
         OUTPUT_FOLDER = f"./outputs/20{data_dict['Tax year']}/"
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
         logging.info(f"📁 Output directory: {OUTPUT_FOLDER}")
 
-        # Track totals across all PFICs
         total_summary = {"ordinary_gains": 0, "ordinary_losses": 0, "capital_losses": 0}
 
         for file in files:
@@ -533,21 +615,11 @@ def main():
                     path=FORM_OUTPUT_PATH, data_dict=data_dict, xlsx=file
                 )
             else:
-                FORM_FULL_PATH = f"{OUTPUT_FOLDER}{file_name}_full.pdf"
-                FORM_OVERLAY_PATH = f"{OUTPUT_FOLDER}{file_name}_overlay.pdf"
                 FORM_OUTPUT_PATH = f"{OUTPUT_FOLDER}{file_name}.pdf"
-
-                number_of_lots, pfic_summary = create_overlay(
-                    path=FORM_OVERLAY_PATH, data_dict=data_dict, xlsx=file
+                number_of_lots, pfic_summary = create_filled_pdf(
+                    output_path=FORM_OUTPUT_PATH, data_dict=data_dict, xlsx=file
                 )
-                create_full_8621(form, number_of_lots, FORM_FULL_PATH)
-                merge_pdfs(FORM_FULL_PATH, FORM_OVERLAY_PATH, FORM_OUTPUT_PATH)
 
-                # Delete intermediate files
-                os.remove(FORM_FULL_PATH)
-                os.remove(FORM_OVERLAY_PATH)
-
-            # Add to total summary
             total_summary["ordinary_gains"] += pfic_summary["ordinary_gains"]
             total_summary["ordinary_losses"] += pfic_summary["ordinary_losses"]
             total_summary["capital_losses"] += pfic_summary["capital_losses"]
@@ -556,7 +628,6 @@ def main():
 
         logging.info("✅ All forms processed successfully!")
 
-        # Display summary and instructions with visual emphasis
         logging.info("")
         logging.info("=" * 60)
         logging.info(
