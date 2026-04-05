@@ -8,7 +8,6 @@ import logging
 # Value used to mark a checkbox as checked (PDF name /1)
 CHECKED = "/1"
 
-
 # ---------------------------------------------------------------------------
 # AcroForm field name constants (as they appear in f8621.pdf widget /T keys)
 # ---------------------------------------------------------------------------
@@ -104,7 +103,7 @@ def _part1_fields(
 
     last_er = df_eoy[df_eoy["Year"] == current_year]["Exchange Rate"].values[0]
     last_price = df_eoy[df_eoy["Year"] == current_year]["Price"].values[0]
-    value_of_pfic = round(unsold_shares * last_price / last_er)
+    value_of_pfic = round(unsold_shares * last_price * last_er)
 
     fields = {
         F_DATE_ACQUISITION: str(date_of_acq),
@@ -144,12 +143,12 @@ def _part4_fields(
     cost_acquisition = df_lot["Cost: Acquisition"][lot]
     er_of_acquisition = df_lot["Exchange Rate: Acquisition"][lot]
     num_shares = df_lot["Number of shares"][lot]
-    original_basis = cost_acquisition / er_of_acquisition
+    original_basis = cost_acquisition * er_of_acquisition
 
     if current_year > year_of_acquisition:
         prev_er = df_eoy[df_eoy["Year"] == current_year - 1]["Exchange Rate"].values[0]
         prev_price = df_eoy[df_eoy["Year"] == current_year - 1]["Price"].values[0]
-        adjusted_basis = round(num_shares * prev_price / prev_er)
+        adjusted_basis = round(num_shares * prev_price * prev_er)
     else:
         adjusted_basis = round(original_basis)
 
@@ -160,7 +159,7 @@ def _part4_fields(
         logging.info(f"    📈 Lot {lot + 1}: No sale (holding position)")
         last_er = df_eoy[df_eoy["Year"] == current_year]["Exchange Rate"].values[0]
         last_price = df_eoy[df_eoy["Year"] == current_year]["Price"].values[0]
-        fmv = round(num_shares * last_price / last_er)
+        fmv = round(num_shares * last_price * last_er)
 
         fields[F_10A] = str(fmv)
         fields[F_10B] = str(adjusted_basis)
@@ -201,7 +200,7 @@ def _part4_fields(
         year_of_sale = df_lot["Date: Sale"][lot].year
         if year_of_sale < current_year:
             return None, lot_summary
-        proceeds = round(num_shares * last_price / last_er)
+        proceeds = round(num_shares * last_price * last_er)
         sale_gain_loss = proceeds - adjusted_basis
 
         fields[F_13A] = str(proceeds)
@@ -407,7 +406,7 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
 
     last_er = df_eoy[df_eoy["Year"] == tax_year]["Exchange Rate"].values[0]
     last_price = df_eoy[df_eoy["Year"] == tax_year]["Price"].values[0]
-    fmv_total = round(total_unsold_shares * last_price / last_er)
+    fmv_total = round(total_unsold_shares * last_price * last_er)
 
     lines.append(f"Date of Acquisition  : {date_of_acq}")
     lines.append(f"Number of Shares     : {total_unsold_shares}")
@@ -422,12 +421,12 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
         cost_acquisition = df_lot["Cost: Acquisition"][lot]
         er_of_acquisition = df_lot["Exchange Rate: Acquisition"][lot]
         num_shares = df_lot["Number of shares"][lot]
-        original_basis = cost_acquisition / er_of_acquisition
+        original_basis = cost_acquisition * er_of_acquisition
 
         if tax_year > year_of_acquisition:
             prev_er = df_eoy[df_eoy["Year"] == tax_year - 1]["Exchange Rate"].values[0]
             prev_price = df_eoy[df_eoy["Year"] == tax_year - 1]["Price"].values[0]
-            adjusted_basis = round(num_shares * prev_price / prev_er)
+            adjusted_basis = round(num_shares * prev_price * prev_er)
         else:
             adjusted_basis = round(original_basis)
 
@@ -436,7 +435,7 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
         if np.isnan(df_lot["Price per share: Sale"][lot]):
             lot_er = df_eoy[df_eoy["Year"] == tax_year]["Exchange Rate"].values[0]
             lot_price = df_eoy[df_eoy["Year"] == tax_year]["Price"].values[0]
-            fmv = round(num_shares * lot_price / lot_er)
+            fmv = round(num_shares * lot_price * lot_er)
             gain_loss = fmv - adjusted_basis
 
             lines.append(f"── Part IV — Lot {actual_lots + 1} (held at year-end) ──")
@@ -468,7 +467,7 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
             if year_of_sale < tax_year:
                 number_of_lots -= 1
                 continue
-            proceeds = round(num_shares * sale_price / sale_er)
+            proceeds = round(num_shares * sale_price * sale_er)
             sale_gain_loss = proceeds - adjusted_basis
 
             lines.append(f"── Part IV — Lot {actual_lots + 1} (sold in {tax_year}) ──")
@@ -534,6 +533,7 @@ def read_inputs():
     data_dict["output_format"] = "txt" if output_format in ("t", "txt") else "pdf"
 
     files = glob.glob("inputs/*.xlsx")
+
     return data_dict, files
 
 
