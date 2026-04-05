@@ -1,12 +1,12 @@
-import pdfrw
+import pikepdf
 import pandas as pd
 import numpy as np
 import glob
 import os
 import logging
 
-# Value written into a checkbox field to mark it checked
-CHECKED = pdfrw.PdfObject("/1")
+# Value used to mark a checkbox as checked (PDF name /1)
+CHECKED = "/1"
 
 
 # ---------------------------------------------------------------------------
@@ -62,50 +62,6 @@ F_13C = "f2_22[0]"  # Gain (loss) from line 13a - 13b
 F_14A = "f2_23[0]"  # Unreversed inclusions (sale)
 F_14B = "f2_24[0]"  # Ordinary loss limited by line 14a (sale)
 F_14C = "f2_25[0]"  # Capital loss (sale, basis ≤ original)
-
-
-# ---------------------------------------------------------------------------
-# PDF helpers
-# ---------------------------------------------------------------------------
-
-
-def _fill_fields(pdf: pdfrw.PdfReader, fields: dict[str, str], page_index: int) -> None:
-    """Write *fields* (field_name -> value) into widget annotations on *page_index*."""
-    page = pdf.pages[page_index]
-    annotations = page.Annots
-    if not annotations:
-        return
-    for annot in annotations:
-        if annot.Subtype != "/Widget":
-            continue
-        raw_t = annot.T
-        if not raw_t:
-            continue
-        # Decode UTF-16-BE field name
-        s = str(raw_t).strip("<>")
-        try:
-            name = bytes.fromhex(s).decode("utf-16-be").lstrip("\ufeff")
-        except Exception:
-            name = str(raw_t)
-        if name in fields:
-            annot.update(pdfrw.PdfDict(V=fields[name], AP=""))
-
-
-def fill_pdf(
-    input_path: str, output_path: str, page_fields: list[dict[str, str]]
-) -> None:
-    """
-    Fill *input_path* and write to *output_path*.
-
-    *page_fields* is a list of dicts, one per PDF page (0-indexed).
-    Each dict maps AcroForm field names to string values (or PdfObjects for checkboxes).
-    """
-    pdf = pdfrw.PdfReader(input_path)
-    for page_index, fields in enumerate(page_fields):
-        if fields:
-            _fill_fields(pdf, fields, page_index)
-    pdf.Root.AcroForm.update(pdfrw.PdfDict(NeedAppearances=pdfrw.PdfObject("true")))
-    pdfrw.PdfWriter().write(output_path, pdf)
 
 
 # ---------------------------------------------------------------------------
@@ -349,58 +305,52 @@ def _assemble_and_fill(
     Assemble a final PDF:
       - page 1 of the template (filled with page0_fields)
       - one copy of template page 2 per lot (each filled with the corresponding lot fields)
-
-    We modify the page tree (/Kids, /Count) directly so that the AcroForm dictionary
-    is preserved intact when pdfrw writes the file.
     """
-    template = pdfrw.PdfReader(template_path)
+    template = pikepdf.Pdf.open(template_path)
+    out = pikepdf.Pdf.new()
 
-    # Fill page 1 in-place
-    _fill_page(template.pages[0], page0_fields)
+    # Page 1
+    out.pages.append(template.pages[0])
+    _fill_page(out.pages[0], page0_fields)
 
-    # Fill the template's own page 2 with the first lot
-    if lot_pages:
-        _fill_page(template.pages[1], lot_pages[0])
+    # One lot page per lot
+    for lot_fields in lot_pages:
+        out.pages.append(template.pages[1])
+        out.acroform.fix_copied_annotations(
+            pikepdf.Page(out.pages[-1]),
+            pikepdf.Page(template.pages[1]),
+            template.acroform,
+        )
+        _fill_page(out.pages[-1], lot_fields)
 
-    # For additional lots, re-read the template to get fresh independent page copies
-    extra_pages = []
-    for lot_fields in lot_pages[1:]:
-        fresh = pdfrw.PdfReader(template_path)
-        page = fresh.pages[1]
-        _fill_page(page, lot_fields)
-        extra_pages.append(page)
-
-    # Rebuild the page tree: page 1 + one page 2 per lot (drop template pages 3 & 4)
-    new_kids = (
-        [template.pages[0]] + ([template.pages[1]] if lot_pages else []) + extra_pages
-    )
-    template.Root.Pages.Kids = pdfrw.PdfArray(new_kids)
-    template.Root.Pages.Count = pdfrw.PdfObject(len(new_kids))
-
-    template.Root.AcroForm.update(
-        pdfrw.PdfDict(NeedAppearances=pdfrw.PdfObject("true"))
-    )
-    pdfrw.PdfWriter().write(output_path, template)
+    out.Root.AcroForm.NeedAppearances = True
+    out.save(output_path)
 
 
 def _fill_page(page, fields: dict) -> None:
     """Fill AcroForm widget annotations on a single page object in-place."""
-    annotations = page.Annots
-    if not annotations:
+    annots = page.get("/Annots")
+    if not annots:
         return
-    for annot in annotations:
-        if annot.Subtype != "/Widget":
+    for annot in annots:
+        t = annot.get("/T")
+        if t is None:
             continue
-        raw_t = annot.T
-        if not raw_t:
+        name = str(t)
+        if name not in fields:
             continue
-        s = str(raw_t).strip("<>")
-        try:
-            name = bytes.fromhex(s).decode("utf-16-be").lstrip("\ufeff")
-        except Exception:
-            name = str(raw_t)
-        if name in fields:
-            annot.update(pdfrw.PdfDict(V=fields[name], AP=""))
+        ft = annot.get("/FT")
+        if str(ft) == "/Btn":
+            # Checkboxes: set both /V (value) and /AS (appearance state).
+            val = pikepdf.Name(fields[name])
+            annot["/V"] = val
+            annot["/AS"] = val
+        else:
+            # Text fields: write value and clear any stale appearance stream
+            # so NeedAppearances triggers a fresh render by the viewer.
+            annot["/V"] = pikepdf.String(fields[name])
+            if "/AP" in annot:
+                del annot["/AP"]
 
 
 # ---------------------------------------------------------------------------
