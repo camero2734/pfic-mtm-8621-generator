@@ -1,6 +1,7 @@
 import argparse
 import getpass
 import glob
+import json
 import logging
 import os
 import re
@@ -108,10 +109,21 @@ class Part1Result:
 class LotResult:
     """Results from Part IV computation for a single lot."""
 
-    def __init__(self, lot_index, is_holding, fmv, adjusted_basis, original_basis,
-                 gain_loss, proceeds=None, sale_gain_loss=None,
-                 unreversed=None, ordinary_loss=None, capital_loss=None,
-                 skipped=False):
+    def __init__(
+        self,
+        lot_index,
+        is_holding,
+        fmv,
+        adjusted_basis,
+        original_basis,
+        gain_loss,
+        proceeds=None,
+        sale_gain_loss=None,
+        unreversed=None,
+        ordinary_loss=None,
+        capital_loss=None,
+        skipped=False,
+    ):
         self.lot_index = lot_index
         self.is_holding = is_holding
         self.fmv = fmv
@@ -165,7 +177,9 @@ def validate_tax_year(tax_year_str: str) -> int:
     return 2000 + year_int
 
 
-def validate_xlsx_columns(df: pd.DataFrame, expected: list, sheet_name: str, filepath: str):
+def validate_xlsx_columns(
+    df: pd.DataFrame, expected: list, sheet_name: str, filepath: str
+):
     """Validate that a DataFrame has all expected columns. Exits with error if missing."""
     missing = [col for col in expected if col not in df.columns]
     if missing:
@@ -234,8 +248,9 @@ def validate_sale_data_completeness(df_lot: pd.DataFrame, filepath: str):
 # ---------------------------------------------------------------------------
 
 
-def compute_part1(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, current_year: int,
-                  filepath: str) -> Part1Result:
+def compute_part1(
+    df_lot: pd.DataFrame, df_eoy: pd.DataFrame, current_year: int, filepath: str
+) -> Part1Result:
     """Compute Part I results (shared logic for both PDF and text)."""
     date_of_acq = (
         pd.to_datetime(df_lot["Date: Acquisition"].values[0]).strftime("%Y-%m-%d")
@@ -254,8 +269,13 @@ def compute_part1(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, current_year: int,
     return Part1Result(date_of_acq, unsold_shares, value_of_pfic)
 
 
-def compute_lot(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, lot: int,
-                current_year: int, filepath: str) -> LotResult:
+def compute_lot(
+    df_lot: pd.DataFrame,
+    df_eoy: pd.DataFrame,
+    lot: int,
+    current_year: int,
+    filepath: str,
+) -> LotResult:
     """Compute Part IV results for a single lot. Returns LotResult with skipped=True
     if lot was sold in a prior year."""
     year_of_acquisition = df_lot["Date: Acquisition"][lot].year
@@ -278,9 +298,15 @@ def compute_lot(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, lot: int,
         year_of_sale = df_lot["Date: Sale"][lot].year
 
         if year_of_sale < current_year:
-            return LotResult(lot_index=lot, is_holding=False, fmv=0,
-                              adjusted_basis=adjusted_basis, original_basis=original_basis,
-                              gain_loss=0, skipped=True)
+            return LotResult(
+                lot_index=lot,
+                is_holding=False,
+                fmv=0,
+                adjusted_basis=adjusted_basis,
+                original_basis=original_basis,
+                gain_loss=0,
+                skipped=True,
+            )
 
         proceeds = round(num_shares * sale_price * sale_er)
         sale_gain_loss = proceeds - adjusted_basis
@@ -307,10 +333,16 @@ def compute_lot(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, lot: int,
             logging.info(f"    📈 Lot {lot + 1}: Ordinary gain of ${sale_gain_loss}")
 
         return LotResult(
-            lot_index=lot, is_holding=False, fmv=0,
-            adjusted_basis=adjusted_basis, original_basis=original_basis,
-            gain_loss=0, proceeds=proceeds, sale_gain_loss=sale_gain_loss,
-            unreversed=unreversed, ordinary_loss=ordinary_loss,
+            lot_index=lot,
+            is_holding=False,
+            fmv=0,
+            adjusted_basis=adjusted_basis,
+            original_basis=original_basis,
+            gain_loss=0,
+            proceeds=proceeds,
+            sale_gain_loss=sale_gain_loss,
+            unreversed=unreversed,
+            ordinary_loss=ordinary_loss,
             capital_loss=capital_loss,
         )
 
@@ -344,10 +376,15 @@ def compute_lot(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, lot: int,
             logging.info(f"    📈 Lot {lot + 1}: Ordinary gain of ${gain_loss}")
 
         return LotResult(
-            lot_index=lot, is_holding=True, fmv=fmv,
-            adjusted_basis=adjusted_basis, original_basis=original_basis,
-            gain_loss=gain_loss, unreversed=unreversed,
-            ordinary_loss=ordinary_loss, capital_loss=capital_loss,
+            lot_index=lot,
+            is_holding=True,
+            fmv=fmv,
+            adjusted_basis=adjusted_basis,
+            original_basis=original_basis,
+            gain_loss=gain_loss,
+            unreversed=unreversed,
+            ordinary_loss=ordinary_loss,
+            capital_loss=capital_loss,
         )
 
 
@@ -430,7 +467,9 @@ def _lot_fields(lot_result: LotResult) -> dict | None:
             fields[F_11] = ""
             fields[F_12] = ""
 
-        fields.update({F_13A: "", F_13B: "", F_13C: "", F_14A: "", F_14B: "", F_14C: ""})
+        fields.update(
+            {F_13A: "", F_13B: "", F_13C: "", F_14A: "", F_14B: "", F_14C: ""}
+        )
 
     else:
         # Sold lot
@@ -619,7 +658,9 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
     lines.append(f"Name of shareholder  : {data_dict['Name of shareholder']}")
     lines.append(f"Identifying Number   : {data_dict['Identifying Number']}")
     lines.append(f"Address              : {data_dict['Address']}")
-    lines.append(f"City/State/Zip       : {data_dict['City']}, {data_dict['State']}, {data_dict['Country']}, {data_dict['Postal Code']}")
+    lines.append(
+        f"City/State/Zip       : {data_dict['City']}, {data_dict['State']}, {data_dict['Country']}, {data_dict['Postal Code']}"
+    )
     lines.append(f"Tax year             : 20{data_dict['Tax year']}")
     lines.append(f"Type of shareholder  : Individual")
     lines.append("")
@@ -724,27 +765,68 @@ def parse_args():
         default=None,
         help="Output directory (default: outputs/20YY/ next to this script).",
     )
+    parser.add_argument(
+        "--remember",
+        action="store_true",
+        help="Save entered details to inputs/__details.json for reuse on future runs.",
+    )
     return parser.parse_args()
 
 
+DETAILS_FILENAME = "__details.json"
+
+
+def _details_path(inputs_dir: str) -> str:
+    return os.path.join(inputs_dir, DETAILS_FILENAME)
+
+
+def _load_details(inputs_dir: str) -> dict | None:
+    path = _details_path(inputs_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        logging.info(f"📋 Loaded saved details from {path}")
+        return data
+    except (json.JSONDecodeError, OSError) as exc:
+        logging.warning(f"⚠️  Could not read {path}: {exc}")
+        return None
+
+
+def _save_details(data_dict: dict, inputs_dir: str) -> None:
+    path = _details_path(inputs_dir)
+    os.makedirs(inputs_dir, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data_dict, f, indent=2)
+    logging.info(f"💾 Details saved to {path}")
+
+
 def read_inputs(args):
-    data_dict = {}
+    inputs_dir = args.inputs_dir or os.path.join(SCRIPT_DIR, "inputs")
+    saved = _load_details(inputs_dir)
 
-    logging.info("📝 Enter shareholder details:")
+    if saved is not None:
+        data_dict = saved
+        logging.info("📋 Using saved details (skipping input prompts)")
+    else:
+        data_dict = {}
 
-    data_dict["Name of shareholder"] = input("👤 Name of shareholder: ")
-    data_dict["Identifying Number"] = getpass.getpass(
-        "🆔 Identifying Number (e.g., SSN) [input hidden]: "
-    )
-    data_dict["Address"] = input("🏠 Address (Street + House Number): ")
-    address_line_2 = input("🏠 Address line 2 (or press Enter to skip): ").strip()
-    data_dict["Address line 2"] = address_line_2 if address_line_2 else ""
-    data_dict["City"] = input("🏙️ City: ")
-    data_dict["State"] = input("🗺️ State/Province: ")
-    data_dict["Country"] = input("🌍 Country: ")
-    data_dict["Postal Code"] = input("📮 Postal Code: ")
+        logging.info("📝 Enter shareholder details:")
 
-    data_dict["Tax year"] = input("📅 Tax year (last two digits): ")
+        data_dict["Name of shareholder"] = input("👤 Name of shareholder: ")
+        data_dict["Identifying Number"] = getpass.getpass(
+            "🆔 Identifying Number (e.g., SSN) [input hidden]: "
+        )
+        data_dict["Address"] = input("🏠 Address (Street + House Number): ")
+        address_line_2 = input("🏠 Address line 2 (or press Enter to skip): ").strip()
+        data_dict["Address line 2"] = address_line_2 if address_line_2 else ""
+        data_dict["City"] = input("🏙️ City: ")
+        data_dict["State"] = input("🗺️ State/Province: ")
+        data_dict["Country"] = input("🌍 Country: ")
+        data_dict["Postal Code"] = input("📮 Postal Code: ")
+
+        data_dict["Tax year"] = input("📅 Tax year (last two digits): ")
 
     # Validate tax year early
     validate_tax_year(data_dict["Tax year"])
@@ -755,8 +837,10 @@ def read_inputs(args):
     else:
         data_dict["output_format"] = "pdf"
 
-    # Determine input directory (script-relative by default)
-    inputs_dir = args.inputs_dir or os.path.join(SCRIPT_DIR, "inputs")
+    # Persist if --remember was requested and details weren't already saved
+    if args.remember and saved is None:
+        _save_details(data_dict, inputs_dir)
+
     files = glob.glob(os.path.join(inputs_dir, "*.xlsx"))
 
     # Filter out backup/temp files
