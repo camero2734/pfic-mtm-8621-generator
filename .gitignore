@@ -4,3 +4,4 @@ __pycache__
 
 *.xlsx#
 .venv
+.ruff_cache
