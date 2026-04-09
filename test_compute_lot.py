@@ -704,3 +704,79 @@ class TestFIFOWithFees:
         assert lots.iloc[0]["Number of shares"] == 100
         assert lots.iloc[0]["Price per share: Acquisition"] == 50.5
         assert lots.iloc[0]["Cost: Acquisition"] == 5050.0
+
+
+class TestFIFOFractionalShares:
+    """Fractional share counts must not accumulate floating-point errors."""
+
+    @patch("main.get_exchange_rate", return_value=1.0)
+    def test_partial_sale_fractional_shares_no_fp_drift(self, mock_fx):
+        # Buy 200.603, sell 174.783 → remaining should be exactly 25.82, not
+        # 25.820000000000028 or similar.
+        df_txn = _txn_df(
+            [
+                {"Date": _dt(2022, 1, 15), "Type": "buy", "Number of shares": 200.603, "Total Value": 10030.15},
+                {"Date": _dt(2022, 6, 1), "Type": "sell", "Number of shares": 174.783, "Total Value": 8739.15},
+            ]
+        )
+        lots = fifo_lots_from_transactions(df_txn, "EUR")
+        assert len(lots) == 2
+        remaining = lots.iloc[1]["Number of shares"]
+        assert float(remaining) == 25.82
+        remaining_str = str(remaining)
+        assert "00000" not in remaining_str or remaining_str.endswith("0")
+        assert abs(float(remaining) - 25.82) < 1e-10
+
+    def test_compute_part1_fractional_shares_no_fp_drift(self):
+        # Multiple lots with fractional shares that trigger float accumulation errors:
+        # 500 + 654 + 199 + 182.6025 + 180.957 + 175.2438 = 1891.8033
+        # With plain float += this produces 1891.8032999999998.
+        df_lot = _make_lot_df(
+            [
+                {
+                    "Date: Acquisition": _dt(2023),
+                    "Price per share: Acquisition": 50.0,
+                    "Number of shares": 500,
+                    "Cost: Acquisition": 25000.0,
+                    "Exchange Rate: Acquisition": 1.0,
+                },
+                {
+                    "Date: Acquisition": _dt(2023, 2, 1),
+                    "Price per share: Acquisition": 55.0,
+                    "Number of shares": 654,
+                    "Cost: Acquisition": 35970.0,
+                    "Exchange Rate: Acquisition": 1.0,
+                },
+                {
+                    "Date: Acquisition": _dt(2023, 3, 1),
+                    "Price per share: Acquisition": 40.0,
+                    "Number of shares": 199,
+                    "Cost: Acquisition": 7960.0,
+                    "Exchange Rate: Acquisition": 1.0,
+                },
+                {
+                    "Date: Acquisition": _dt(2023, 4, 1),
+                    "Price per share: Acquisition": 30.0,
+                    "Number of shares": 182.6025,
+                    "Cost: Acquisition": 5478.075,
+                    "Exchange Rate: Acquisition": 1.0,
+                },
+                {
+                    "Date: Acquisition": _dt(2023, 5, 1),
+                    "Price per share: Acquisition": 25.0,
+                    "Number of shares": 180.957,
+                    "Cost: Acquisition": 4523.925,
+                    "Exchange Rate: Acquisition": 1.0,
+                },
+                {
+                    "Date: Acquisition": _dt(2023, 6, 1),
+                    "Price per share: Acquisition": 20.0,
+                    "Number of shares": 175.2438,
+                    "Cost: Acquisition": 3504.876,
+                    "Exchange Rate: Acquisition": 1.0,
+                },
+            ]
+        )
+        df_eoy = _make_eoy_df([(2023, 60.0, 1.0)])
+        result = compute_part1(df_lot, df_eoy, 2023, FILEPATH)
+        assert str(result.unsold_shares) == "1891.8033"

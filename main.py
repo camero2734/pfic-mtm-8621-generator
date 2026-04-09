@@ -330,7 +330,7 @@ def fifo_lots_from_transactions(df_txn: pd.DataFrame, currency: str) -> pd.DataF
         ttype = str(row["Type"]).strip().lower()
         if ttype in BUY_TYPES:
             total_value = row["Total Value"]
-            num_shares = Decimal(row["Number of shares"])
+            num_shares = Decimal(str(row["Number of shares"]))
             er = get_exchange_rate(currency, row["Date"])
             open_lots.append(
                 {
@@ -346,7 +346,7 @@ def fifo_lots_from_transactions(df_txn: pd.DataFrame, currency: str) -> pd.DataF
                 }
             )
         elif ttype in SELL_TYPES:
-            to_sell = Decimal(row["Number of shares"])
+            to_sell = Decimal(str(row["Number of shares"]))
             sale_date = row["Date"]
             sale_price = row["Total Value"] / row["Number of shares"]
             sale_er = get_exchange_rate(currency, sale_date)
@@ -420,7 +420,7 @@ def compute_part1(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, current_year: int,
     unsold_shares = Decimal(0)
     for lot in range(len(df_lot.index)):
         if np.isnan(df_lot["Price per share: Sale"][lot]):
-            unsold_shares += Decimal(df_lot["Number of shares"][lot])
+            unsold_shares += Decimal(str(df_lot["Number of shares"][lot]))
 
     last_er = get_eoy_value(df_eoy, current_year, "Exchange Rate", filepath)
     last_price = get_eoy_value(df_eoy, current_year, "Price", filepath)
