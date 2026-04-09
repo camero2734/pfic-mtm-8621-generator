@@ -284,12 +284,22 @@ def compute_lot(
     num_shares = df_lot["Number of shares"][lot]
     original_basis = cost_acquisition * er_of_acquisition
 
-    if current_year > year_of_acquisition:
-        prev_er = get_eoy_value(df_eoy, current_year - 1, "Exchange Rate", filepath)
-        prev_price = get_eoy_value(df_eoy, current_year - 1, "Price", filepath)
-        adjusted_basis = round(num_shares * prev_price * prev_er)
-    else:
-        adjusted_basis = round(original_basis)
+    aab = original_basis
+    uni = 0.0
+    for year in range(year_of_acquisition, current_year):
+        price = get_eoy_value(df_eoy, year, "Price", filepath)
+        fx = get_eoy_value(df_eoy, year, "Exchange Rate", filepath)
+        fmv = round(num_shares * price * fx)
+        raw_mtm = fmv - aab
+        if raw_mtm >= 0:
+            aab = aab + raw_mtm
+            uni = uni + raw_mtm
+        else:
+            allowed_loss = min(-raw_mtm, uni)
+            aab = aab - allowed_loss
+            uni = uni - allowed_loss
+    adjusted_basis = round(aab)
+    unreversed_amount = round(uni)
 
     if not np.isnan(df_lot["Price per share: Sale"][lot]):
         # Sold lot
@@ -312,8 +322,8 @@ def compute_lot(
         sale_gain_loss = proceeds - adjusted_basis
 
         if sale_gain_loss < 0:
-            if adjusted_basis > original_basis:
-                unreversed = round(adjusted_basis - original_basis)
+            if unreversed_amount > 0:
+                unreversed = unreversed_amount
                 ordinary_loss = -min(unreversed, -sale_gain_loss)
                 capital_loss = None
                 logging.info(
@@ -356,8 +366,8 @@ def compute_lot(
         logging.info(f"    📈 Lot {lot + 1}: No sale (holding position)")
 
         if gain_loss < 0:
-            if adjusted_basis > original_basis:
-                unreversed = round(adjusted_basis - original_basis)
+            if unreversed_amount > 0:
+                unreversed = unreversed_amount
                 ordinary_loss = -min(unreversed, -gain_loss)
                 logging.info(
                     f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(ordinary_loss)}"
@@ -478,7 +488,7 @@ def _lot_fields(lot_result: LotResult) -> dict | None:
         fields[F_13C] = str(lot_result.sale_gain_loss)
 
         if lot_result.sale_gain_loss < 0:
-            if lot_result.adjusted_basis > lot_result.original_basis:
+            if lot_result.unreversed is not None and lot_result.unreversed > 0:
                 fields[F_14A] = str(lot_result.unreversed)
                 fields[F_14B] = str(lot_result.ordinary_loss)
                 fields[F_14C] = ""
