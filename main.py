@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+from decimal import Decimal
 
 import numpy as np
 import pandas as pd
@@ -136,7 +137,9 @@ def get_exchange_rate(currency: str, date) -> float:
         _prefetch_rates(currency, date)
 
     if currency in _fx_cache and date in _fx_cache[currency]:
-        return _fx_cache[currency][date]
+        rate = _fx_cache[currency][date]
+        logging.info(f"  💱 {currency}/USD on {date.date()}: {rate:.4f}")
+        return rate
 
     raise ValueError(
         f"Could not find exchange rate for {currency} on {date.date()}. "
@@ -185,16 +188,10 @@ def _prefetch_rates(currency: str, date):
         if pd.notna(val):
             _fx_cache[currency][pd.Timestamp(idx)] = float(val)
 
-    # If exact date not available (weekend/holiday), use nearest prior business day
+    # If exact date not available (weekend/holiday), use nearest business day
     if date not in _fx_cache[currency]:
-        available = sorted(_fx_cache[currency].keys())
-        prior = [d for d in available if d <= date]
-        if prior:
-            _fx_cache[currency][date] = _fx_cache[currency][prior[-1]]
-        else:
-            nearest = [d for d in available if d >= date]
-            if nearest:
-                _fx_cache[currency][date] = _fx_cache[currency][nearest[0]]
+        nearest = min(_fx_cache[currency].keys(), key=lambda d: abs(d - date))
+        _fx_cache[currency][date] = _fx_cache[currency][nearest]
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +330,12 @@ def fifo_lots_from_transactions(df_txn: pd.DataFrame, currency: str) -> pd.DataF
         ttype = str(row["Type"]).strip().lower()
         if ttype in BUY_TYPES:
             total_value = row["Total Value"]
-            num_shares = row["Number of shares"]
+            num_shares = Decimal(row["Number of shares"])
             er = get_exchange_rate(currency, row["Date"])
             open_lots.append(
                 {
                     "Date: Acquisition": row["Date"],
-                    "Price per share: Acquisition": total_value / num_shares,
+                    "Price per share: Acquisition": total_value / float(num_shares),
                     "Number of shares": num_shares,
                     "Cost: Acquisition": total_value,
                     "Exchange Rate: Acquisition": er,
@@ -349,7 +346,7 @@ def fifo_lots_from_transactions(df_txn: pd.DataFrame, currency: str) -> pd.DataF
                 }
             )
         elif ttype in SELL_TYPES:
-            to_sell = row["Number of shares"]
+            to_sell = Decimal(row["Number of shares"])
             sale_date = row["Date"]
             sale_price = row["Total Value"] / row["Number of shares"]
             sale_er = get_exchange_rate(currency, sale_date)
@@ -362,33 +359,33 @@ def fifo_lots_from_transactions(df_txn: pd.DataFrame, currency: str) -> pd.DataF
                     new_lots.append(lot)
                     continue
                 fill = min(lot["_remaining"], to_sell)
-                cost_per_share = lot["Cost: Acquisition"] / lot["_remaining"]
+                cost_per_share = lot["Cost: Acquisition"] / float(lot["_remaining"])
                 if fill < lot["_remaining"]:
                     new_lots.append(
                         {
                             "Date: Acquisition": lot["Date: Acquisition"],
                             "Price per share: Acquisition": lot["Price per share: Acquisition"],
                             "Number of shares": fill,
-                            "Cost: Acquisition": fill * cost_per_share,
+                            "Cost: Acquisition": float(fill) * cost_per_share,
                             "Exchange Rate: Acquisition": lot["Exchange Rate: Acquisition"],
                             "Date: Sale": sale_date,
                             "Price per share: Sale": sale_price,
                             "Exchange Rate: Sale": sale_er,
-                            "_remaining": 0,
+                            "_remaining": Decimal(0),
                         }
                     )
                     remaining = lot["_remaining"] - fill
                     lot["Number of shares"] = remaining
-                    lot["Cost: Acquisition"] = remaining * cost_per_share
+                    lot["Cost: Acquisition"] = float(remaining) * cost_per_share
                     lot["_remaining"] = remaining
                     new_lots.append(lot)
                 else:
                     lot["Number of shares"] = fill
-                    lot["Cost: Acquisition"] = fill * cost_per_share
+                    lot["Cost: Acquisition"] = float(fill) * cost_per_share
                     lot["Date: Sale"] = sale_date
                     lot["Price per share: Sale"] = sale_price
                     lot["Exchange Rate: Sale"] = sale_er
-                    lot["_remaining"] = 0
+                    lot["_remaining"] = Decimal(0)
                     new_lots.append(lot)
                 to_sell -= fill
             open_lots = new_lots
@@ -420,14 +417,14 @@ def compute_part1(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, current_year: int,
         if len(df_lot.index) == 1
         else "Multiple"
     )
-    unsold_shares = 0
+    unsold_shares = Decimal(0)
     for lot in range(len(df_lot.index)):
         if np.isnan(df_lot["Price per share: Sale"][lot]):
-            unsold_shares += df_lot["Number of shares"][lot]
+            unsold_shares += Decimal(df_lot["Number of shares"][lot])
 
     last_er = get_eoy_value(df_eoy, current_year, "Exchange Rate", filepath)
     last_price = get_eoy_value(df_eoy, current_year, "Price", filepath)
-    value_of_pfic = round(unsold_shares * last_price * last_er)
+    value_of_pfic = round(float(unsold_shares) * last_price * last_er)
 
     return Part1Result(date_of_acq, unsold_shares, value_of_pfic)
 
@@ -444,7 +441,7 @@ def compute_lot(
     year_of_acquisition = df_lot["Date: Acquisition"][lot].year
     cost_acquisition = df_lot["Cost: Acquisition"][lot]
     er_of_acquisition = df_lot["Exchange Rate: Acquisition"][lot]
-    num_shares = df_lot["Number of shares"][lot]
+    num_shares = float(df_lot["Number of shares"][lot])
     original_basis = cost_acquisition * er_of_acquisition
 
     aab = original_basis
@@ -698,7 +695,6 @@ def add_eoy_exchange_rates(df_eoy: pd.DataFrame, currency: str) -> pd.DataFrame:
         date = pd.Timestamp(year=int(row["Year"]), month=12, day=31)
         rate = get_exchange_rate(currency, date)
         rates.append(rate)
-        logging.info(f"  💱 {currency}/USD on {date.date()}: {rate:.4f}")
     df_eoy["Exchange Rate"] = rates
     return df_eoy
 
