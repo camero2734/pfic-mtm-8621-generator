@@ -1,4 +1,5 @@
 import argparse
+import html
 import getpass
 import glob
 import json
@@ -12,6 +13,7 @@ import numpy as np
 import pandas as pd
 import pandas_datareader.data as web
 import pikepdf
+import weasyprint
 
 # ---------------------------------------------------------------------------
 # Script directory (for locating template PDF regardless of cwd)
@@ -225,6 +227,7 @@ class LotResult:
         ordinary_loss=None,
         capital_loss=None,
         skipped=False,
+        roll_forward=None,
     ):
         self.lot_index = lot_index
         self.is_holding = is_holding
@@ -238,6 +241,7 @@ class LotResult:
         self.ordinary_loss = ordinary_loss
         self.capital_loss = capital_loss
         self.skipped = skipped
+        self.roll_forward = roll_forward or []
 
     @property
     def lot_summary(self) -> dict:
@@ -446,18 +450,34 @@ def compute_lot(
 
     aab = original_basis
     uni = 0.0
+    roll_forward = []
     for year in range(year_of_acquisition, current_year):
         price = get_eoy_value(df_eoy, year, "Price", filepath)
         fx = get_eoy_value(df_eoy, year, "Exchange Rate", filepath)
         fmv = round(num_shares * price * fx)
         raw_mtm = fmv - aab
+        aab_before = aab
         if raw_mtm >= 0:
             aab = aab + raw_mtm
             uni = uni + raw_mtm
+            allowed_loss = 0
         else:
             allowed_loss = min(-raw_mtm, uni)
             aab = aab - allowed_loss
             uni = uni - allowed_loss
+        roll_forward.append(
+            {
+                "year": year,
+                "eoy_price": price,
+                "eoy_fx": fx,
+                "fmv": fmv,
+                "aab_begin": round(aab_before),
+                "raw_mtm": raw_mtm,
+                "allowed_loss": allowed_loss,
+                "aab_end": round(aab),
+                "uni_end": round(uni),
+            }
+        )
     adjusted_basis = round(aab)
     unreversed_amount = round(uni)
 
@@ -476,6 +496,7 @@ def compute_lot(
                 original_basis=original_basis,
                 gain_loss=0,
                 skipped=True,
+                roll_forward=roll_forward,
             )
 
         proceeds = round(num_shares * sale_price * sale_er)
@@ -510,6 +531,7 @@ def compute_lot(
             unreversed=unreversed,
             ordinary_loss=ordinary_loss,
             capital_loss=capital_loss,
+            roll_forward=roll_forward,
         )
 
     else:
@@ -547,6 +569,7 @@ def compute_lot(
             unreversed=unreversed,
             ordinary_loss=ordinary_loss,
             capital_loss=capital_loss,
+            roll_forward=roll_forward,
         )
 
 
@@ -922,6 +945,231 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
 
 
 # ---------------------------------------------------------------------------
+# Supporting XLSX output (calculation worksheet)
+# ---------------------------------------------------------------------------
+
+
+def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list):
+    """
+    Generate a single PDF with one page per PFIC showing the AAB/UNI roll-forward
+    calculations for each lot.  Returns a list of pfic_summary dicts, one per PFIC file.
+    """
+    tax_year = validate_tax_year(data_dict["Tax year"])
+
+    all_summaries = []
+    sections = []
+
+    CURRENCY_SYMBOLS = {"EUR": "€", "GBP": "£", "JPY": "¥", "CAD": "C$", "AUD": "A$", "CHF": "CHF", "USD": "$"}
+
+    def fmt_money(v, currency=None):
+        if v is None:
+            return "—"
+        symbol = CURRENCY_SYMBOLS.get(currency, "$") if currency else "$"
+        if v < 0:
+            return f"({symbol}{abs(v):,.2f})"
+        return f"{symbol}{v:,.2f}"
+
+    def fmt_fx(v):
+        return f"{v:.4f}" if v is not None else "—"
+
+    CSS = """
+    @page { size: letter; margin: 0.75in 0.6in; }
+    body { font-family: Helvetica, Arial, sans-serif; font-size: 9.5pt; color: #222; }
+    h1 { font-size: 14pt; margin: 0 0 4pt 0; }
+    .subtitle { font-size: 10pt; color: #555; margin: 0 0 12pt 0; }
+    h2 {
+      font-size: 11pt; color: #fff; background: #4472C4;
+      padding: 4pt 8pt; margin: 16pt 0 6pt 0; break-after: avoid;
+    }
+    .kv-table { border-collapse: collapse; margin: 0 0 6pt 0; }
+    .kv-table td { padding: 2pt 8pt 2pt 0; vertical-align: top; }
+    .kv-table td:first-child { font-weight: bold; white-space: nowrap; }
+    h3 {
+      font-size: 9.5pt; background: #D9E2F3;
+      padding: 3pt 6pt; margin: 10pt 0 4pt 0; break-after: avoid;
+    }
+    table.roll {
+      border-collapse: collapse; width: 100%;
+      margin: 0 0 6pt 0; font-size: 8.5pt;
+    }
+    table.roll th, table.roll td {
+      border: 1px solid #999; padding: 3pt 5pt; text-align: right;
+    }
+    table.roll th { background: #f0f0f0; font-weight: bold; font-size: 8pt; }
+    table.roll td:first-child { text-align: center; }
+    table.line-items { border-collapse: collapse; margin: 0 0 6pt 0; }
+    table.line-items td { padding: 2pt 8pt 2pt 0; }
+    table.line-items td:first-child { font-weight: bold; white-space: nowrap; }
+    table.line-items td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+    .summary-table { border-collapse: collapse; margin: 6pt 0; }
+    .summary-table td { padding: 2pt 10pt 2pt 0; }
+    .summary-table td:first-child { font-weight: bold; }
+    .summary-table td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+    .page-break { page-break-before: always; }
+    """
+
+    sections = []
+
+    for xlsx in xlsx_files:
+        file_name = os.path.splitext(os.path.basename(xlsx))[0]
+        df_lot, df_eoy, df_pfic = load_xlsx(xlsx)
+        number_of_lots = len(df_lot.index)
+        pfic_name = str(df_pfic["PFIC Name"].values[0])
+        currency = str(df_pfic["Currency"].values[0]).strip().upper()
+        pfic_summary = {"ordinary_gains": 0, "ordinary_losses": 0, "capital_losses": 0}
+        part1 = compute_part1(df_lot, df_eoy, tax_year, xlsx)
+
+        parts = []
+        parts.append(f"<h1>{html.escape(file_name.upper())} ({html.escape(pfic_name)})</h1>")
+        parts.append(
+            f'<p class="subtitle">Shareholder: {html.escape(data_dict["Name of shareholder"])} '
+            f"&bull; Tax Year 20{html.escape(data_dict['Tax year'])} "
+            f"&bull; Currency: {html.escape(currency)}</p>"
+        )
+
+        parts.append("<h2>Part I &mdash; PFIC Information</h2>")
+        parts.append('<table class="kv-table">')
+        parts.append(f"<tr><td>Date of Acquisition</td><td>{html.escape(str(part1.date_of_acq))}</td></tr>")
+        parts.append(f"<tr><td>Unsold Shares</td><td>{html.escape(str(part1.unsold_shares))}</td></tr>")
+        parts.append(f"<tr><td>FMV (&sect;1296)</td><td>{fmt_money(part1.value_of_pfic)}</td></tr>")
+        parts.append("</table>")
+
+        actual_lots = 0
+
+        for lot in range(number_of_lots):
+            lot_result = compute_lot(df_lot, df_eoy, lot, tax_year, xlsx)
+            if lot_result.skipped:
+                continue
+
+            actual_lots += 1
+            pfic_summary["ordinary_gains"] += lot_result.lot_summary["ordinary_gains"]
+            pfic_summary["ordinary_losses"] += lot_result.lot_summary["ordinary_losses"]
+            pfic_summary["capital_losses"] += lot_result.lot_summary["capital_losses"]
+
+            status = "held at year-end" if lot_result.is_holding else f"sold in {tax_year}"
+            parts.append(f"<h2>Lot {actual_lots} &mdash; {status}</h2>")
+
+            acq_date = df_lot["Date: Acquisition"][lot]
+            acq_str = str(acq_date.date()) if hasattr(acq_date, "date") else str(acq_date)
+            num_shares = float(df_lot["Number of shares"][lot])
+            cost_acq = df_lot["Cost: Acquisition"][lot]
+            er_acq = df_lot["Exchange Rate: Acquisition"][lot]
+
+            parts.append('<table class="kv-table">')
+            parts.append(f"<tr><td>Acquisition Date</td><td>{html.escape(acq_str)}</td></tr>")
+            parts.append(f"<tr><td>Shares</td><td>{num_shares:,.2f}</td></tr>")
+            parts.append(f"<tr><td>Cost ({html.escape(currency)})</td><td>{fmt_money(cost_acq, currency)}</td></tr>")
+            parts.append(f"<tr><td>Acquisition FX Rate</td><td>{fmt_fx(er_acq)}</td></tr>")
+            parts.append(f"<tr><td>Original Basis (USD)</td><td>{fmt_money(lot_result.original_basis)}</td></tr>")
+
+            if not lot_result.is_holding:
+                sale_date = df_lot["Date: Sale"][lot]
+                sale_str = str(sale_date.date()) if hasattr(sale_date, "date") else str(sale_date)
+                sale_price = df_lot["Price per share: Sale"][lot]
+                sale_er = df_lot["Exchange Rate: Sale"][lot]
+                parts.append(f"<tr><td>Sale Date</td><td>{html.escape(sale_str)}</td></tr>")
+                parts.append(
+                    f"<tr><td>Sale Price/Share ({html.escape(currency)})</td><td>{fmt_money(sale_price, currency)}</td></tr>"
+                )
+                parts.append(f"<tr><td>Sale FX Rate</td><td>{fmt_fx(sale_er)}</td></tr>")
+
+            parts.append("</table>")
+
+            parts.append("<h3>AAB / UNI Roll-Forward</h3>")
+            parts.append('<table class="roll">')
+            parts.append("<thead><tr>")
+            for hdr in [
+                "Year",
+                f"EOY Price ({html.escape(currency)})",
+                "EOY FX Rate",
+                "FMV (USD)",
+                "AAB Begin (USD)",
+                "Raw MTM (USD)",
+                "Allowed Loss (USD)",
+                "AAB End (USD)",
+                "UNI End (USD)",
+            ]:
+                parts.append(f"<th>{hdr}</th>")
+            parts.append("</tr></thead><tbody>")
+
+            for entry in lot_result.roll_forward:
+                parts.append("<tr>")
+                parts.append(f"<td>{entry['year']}</td>")
+                parts.append(f"<td>{fmt_money(entry['eoy_price'], currency)}</td>")
+                parts.append(f"<td>{fmt_fx(entry['eoy_fx'])}</td>")
+                parts.append(f"<td>{fmt_money(entry['fmv'])}</td>")
+                parts.append(f"<td>{fmt_money(entry['aab_begin'])}</td>")
+                parts.append(f"<td>{fmt_money(entry['raw_mtm'])}</td>")
+                parts.append(f"<td>{fmt_money(entry['allowed_loss'])}</td>")
+                parts.append(f"<td>{fmt_money(entry['aab_end'])}</td>")
+                parts.append(f"<td>{fmt_money(entry['uni_end'])}</td>")
+                parts.append("</tr>")
+
+            parts.append("</tbody></table>")
+
+            parts.append("<h3>Form 8621 Line Items</h3>")
+            parts.append('<table class="line-items">')
+
+            if lot_result.is_holding:
+                items = [
+                    ("10a &mdash; FMV at year-end", lot_result.fmv),
+                    ("10b &mdash; Adjusted basis at year-end", lot_result.adjusted_basis),
+                    ("10c &mdash; Gain/(Loss)", lot_result.gain_loss),
+                ]
+                if lot_result.gain_loss < 0:
+                    items.append(
+                        (
+                            "11 &mdash; Unreversed inclusions",
+                            lot_result.unreversed if lot_result.unreversed is not None else 0,
+                        )
+                    )
+                    items.append(
+                        (
+                            "12 &mdash; Ordinary loss",
+                            lot_result.ordinary_loss if lot_result.ordinary_loss is not None else 0,
+                        )
+                    )
+            else:
+                items = [
+                    ("13a &mdash; Sale proceeds", lot_result.proceeds),
+                    ("13b &mdash; Adjusted basis at sale", lot_result.adjusted_basis),
+                    ("13c &mdash; Gain/(Loss)", lot_result.sale_gain_loss),
+                ]
+                if lot_result.sale_gain_loss is not None and lot_result.sale_gain_loss < 0:
+                    if lot_result.unreversed is not None and lot_result.unreversed > 0:
+                        items.append(("14a &mdash; Unreversed inclusions", lot_result.unreversed))
+                        items.append(("14b &mdash; Ordinary loss", lot_result.ordinary_loss))
+                    else:
+                        items.append(("14a &mdash; Unreversed inclusions", 0))
+                        items.append(("14b &mdash; Ordinary loss", 0))
+                        items.append(("14c &mdash; Capital loss", lot_result.capital_loss))
+
+            for label, val in items:
+                parts.append(f"<tr><td>{label}</td><td>{fmt_money(val)}</td></tr>")
+            parts.append("</table>")
+
+        parts.append("<h2>Summary of Gains and Losses</h2>")
+        parts.append('<table class="summary-table">')
+        parts.append(f"<tr><td>Total Ordinary Gains</td><td>{fmt_money(pfic_summary['ordinary_gains'])}</td></tr>")
+        parts.append(f"<tr><td>Total Ordinary Losses</td><td>{fmt_money(pfic_summary['ordinary_losses'])}</td></tr>")
+        parts.append(f"<tr><td>Total Capital Losses</td><td>{fmt_money(pfic_summary['capital_losses'])}</td></tr>")
+        parts.append("</table>")
+
+        sections.append("\n".join(parts))
+        all_summaries.append(pfic_summary)
+
+    html_content = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>{CSS}</style></head><body>
+{'<div class="page-break">'.join(sections)}
+</body></html>"""
+
+    logging.getLogger("weasyprint").setLevel(logging.ERROR)
+    weasyprint.HTML(string=html_content).write_pdf(output_path)
+
+    return all_summaries
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1071,6 +1319,10 @@ def main():
             total_summary["capital_losses"] += pfic_summary["capital_losses"]
 
             logging.info(f"  ✅ Form completed and saved to {form_output_path}")
+
+        supporting_path = os.path.join(output_dir, f"20{data_dict['Tax year']}_supporting.pdf")
+        generate_supporting_pdf(output_path=supporting_path, data_dict=data_dict, xlsx_files=files)
+        logging.info(f"📊 Supporting document saved to {supporting_path}")
 
         logging.info("✅ All forms processed successfully!")
 
