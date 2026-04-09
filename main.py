@@ -816,7 +816,7 @@ def read_inputs(args):
 
         data_dict["Name of shareholder"] = input("👤 Name of shareholder: ")
         data_dict["Identifying Number"] = getpass.getpass(
-            "🆔 Identifying Number (e.g., SSN) [input hidden]: "
+            "🆔 Identifying Number (e.g., SSN)"
         )
         data_dict["Address"] = input("🏠 Address (Street + House Number): ")
         address_line_2 = input("🏠 Address line 2 (or press Enter to skip): ").strip()
