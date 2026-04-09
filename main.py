@@ -228,6 +228,7 @@ class LotResult:
         capital_loss=None,
         skipped=False,
         roll_forward=None,
+        calc_detail=None,
     ):
         self.lot_index = lot_index
         self.is_holding = is_holding
@@ -242,6 +243,7 @@ class LotResult:
         self.capital_loss = capital_loss
         self.skipped = skipped
         self.roll_forward = roll_forward or []
+        self.calc_detail = calc_detail or {}
 
     @property
     def lot_summary(self) -> dict:
@@ -502,6 +504,15 @@ def compute_lot(
         proceeds = round(num_shares * sale_price * sale_er)
         sale_gain_loss = proceeds - adjusted_basis
 
+        calc_detail = {
+            "shares": num_shares,
+            "sale_price": sale_price,
+            "sale_fx": sale_er,
+            "sale_date": str(df_lot["Date: Sale"][lot].date())
+            if hasattr(df_lot["Date: Sale"][lot], "date")
+            else str(df_lot["Date: Sale"][lot]),
+        }
+
         if sale_gain_loss < 0:
             if unreversed_amount > 0:
                 unreversed = unreversed_amount
@@ -532,6 +543,7 @@ def compute_lot(
             ordinary_loss=ordinary_loss,
             capital_loss=capital_loss,
             roll_forward=roll_forward,
+            calc_detail=calc_detail,
         )
 
     else:
@@ -542,6 +554,13 @@ def compute_lot(
 
         gain_loss = fmv - adjusted_basis
         logging.info(f"    📈 Lot {lot + 1}: No sale (holding position)")
+
+        calc_detail = {
+            "shares": num_shares,
+            "eoy_price": last_price,
+            "eoy_fx": last_er,
+            "eoy_date": f"{current_year}-12-31",
+        }
 
         if gain_loss < 0:
             if unreversed_amount > 0:
@@ -570,6 +589,7 @@ def compute_lot(
             ordinary_loss=ordinary_loss,
             capital_loss=capital_loss,
             roll_forward=roll_forward,
+            calc_detail=calc_detail,
         )
 
 
@@ -951,7 +971,7 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
 
 def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list):
     """
-    Generate a single PDF with one page per PFIC showing the AAB/UNI roll-forward
+    Generate a single PDF with one page per PFIC showing the AdB/UNI roll-forward
     calculations for each lot.  Returns a list of pfic_summary dicts, one per PFIC file.
     """
     tax_year = validate_tax_year(data_dict["Tax year"])
@@ -965,6 +985,11 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
         if v is None:
             return "—"
         symbol = CURRENCY_SYMBOLS.get(currency, "$") if currency else "$"
+        if float(v) == int(v):
+            v = int(v)
+            if v < 0:
+                return f"({symbol}{abs(v):,})"
+            return f"{symbol}{v:,}"
         if v < 0:
             return f"({symbol}{abs(v):,.2f})"
         return f"{symbol}{v:,.2f}"
@@ -988,6 +1013,7 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
       font-size: 9.5pt; background: #D9E2F3;
       padding: 3pt 6pt; margin: 10pt 0 4pt 0; break-after: avoid;
     }
+    .glossary { font-size: 8pt; color: #555; margin: 0 0 6pt 0; line-height: 1.3; }
     table.roll {
       border-collapse: collapse; width: 100%;
       margin: 0 0 6pt 0; font-size: 8.5pt;
@@ -1001,6 +1027,7 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
     table.line-items td { padding: 2pt 8pt 2pt 0; }
     table.line-items td:first-child { font-weight: bold; white-space: nowrap; }
     table.line-items td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+    .line-items tr.calc-detail td { font-size: 8pt; color: #666; font-weight: normal; padding-top: 0; }
     .summary-table { border-collapse: collapse; margin: 6pt 0; }
     .summary-table td { padding: 2pt 10pt 2pt 0; }
     .summary-table td:first-child { font-weight: bold; }
@@ -1059,7 +1086,11 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
             parts.append(f"<tr><td>Acquisition Date</td><td>{html.escape(acq_str)}</td></tr>")
             parts.append(f"<tr><td>Shares</td><td>{num_shares:,.2f}</td></tr>")
             parts.append(f"<tr><td>Cost ({html.escape(currency)})</td><td>{fmt_money(cost_acq, currency)}</td></tr>")
-            parts.append(f"<tr><td>Acquisition FX Rate</td><td>{fmt_fx(er_acq)}</td></tr>")
+            fred_series = FRED_FX_SERIES.get(currency, "")
+            series_note = f" (FRED {fred_series})" if fred_series else ""
+            parts.append(
+                f"<tr><td>Acquisition FX Rate</td><td>{fmt_fx(er_acq)} as of {html.escape(acq_str)}{series_note}</td></tr>"
+            )
             parts.append(f"<tr><td>Original Basis (USD)</td><td>{fmt_money(lot_result.original_basis)}</td></tr>")
 
             if not lot_result.is_holding:
@@ -1071,22 +1102,27 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
                 parts.append(
                     f"<tr><td>Sale Price/Share ({html.escape(currency)})</td><td>{fmt_money(sale_price, currency)}</td></tr>"
                 )
-                parts.append(f"<tr><td>Sale FX Rate</td><td>{fmt_fx(sale_er)}</td></tr>")
+                parts.append(
+                    f"<tr><td>Sale FX Rate</td><td>{fmt_fx(sale_er)} as of {html.escape(sale_str)}{series_note}</td></tr>"
+                )
 
             parts.append("</table>")
 
-            parts.append("<h3>AAB / UNI Roll-Forward</h3>")
+            parts.append("<h3>AdB / UNI Roll-Forward</h3>")
+            parts.append(
+                '<p class="glossary">AdB = Adjusted Basis &bull; UNI = Unreversed Inclusions &bull; MTM = Mark-to-Market &bull; FMV = Fair Market Value</p>'
+            )
             parts.append('<table class="roll">')
             parts.append("<thead><tr>")
             for hdr in [
                 "Year",
                 f"EOY Price ({html.escape(currency)})",
-                "EOY FX Rate",
+                "EOY FX Rate" + (f" ({fred_series})" if fred_series else ""),
                 "FMV (USD)",
-                "AAB Begin (USD)",
+                "AdB Begin (USD)",
                 "Raw MTM (USD)",
                 "Allowed Loss (USD)",
-                "AAB End (USD)",
+                "AdB End (USD)",
                 "UNI End (USD)",
             ]:
                 parts.append(f"<th>{hdr}</th>")
@@ -1111,8 +1147,13 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
             parts.append('<table class="line-items">')
 
             if lot_result.is_holding:
+                cd = lot_result.calc_detail
                 items = [
                     ("10a &mdash; FMV at year-end", lot_result.fmv),
+                    (
+                        f"&emsp;{cd['shares']:,.2f} shares &times; {html.escape(currency)} {fmt_money(cd['eoy_price'], currency)}/share &times; {fmt_fx(cd['eoy_fx'])} FX as of {html.escape(cd['eoy_date'])}{series_note}",
+                        None,
+                    ),
                     ("10b &mdash; Adjusted basis at year-end", lot_result.adjusted_basis),
                     ("10c &mdash; Gain/(Loss)", lot_result.gain_loss),
                 ]
@@ -1130,8 +1171,13 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
                         )
                     )
             else:
+                cd = lot_result.calc_detail
                 items = [
                     ("13a &mdash; Sale proceeds", lot_result.proceeds),
+                    (
+                        f"&emsp;{cd['shares']:,.2f} shares &times; {html.escape(currency)} {fmt_money(cd['sale_price'], currency)}/share &times; {fmt_fx(cd['sale_fx'])} FX as of {html.escape(cd['sale_date'])}{series_note}",
+                        None,
+                    ),
                     ("13b &mdash; Adjusted basis at sale", lot_result.adjusted_basis),
                     ("13c &mdash; Gain/(Loss)", lot_result.sale_gain_loss),
                 ]
@@ -1145,7 +1191,10 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
                         items.append(("14c &mdash; Capital loss", lot_result.capital_loss))
 
             for label, val in items:
-                parts.append(f"<tr><td>{label}</td><td>{fmt_money(val)}</td></tr>")
+                if val is None:
+                    parts.append(f'<tr class="calc-detail"><td>{label}</td><td></td></tr>')
+                else:
+                    parts.append(f"<tr><td>{label}</td><td>{fmt_money(val)}</td></tr>")
             parts.append("</table>")
 
         parts.append("<h2>Summary of Gains and Losses</h2>")
