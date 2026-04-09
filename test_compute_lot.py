@@ -11,9 +11,8 @@ AAB = adjusted adjusted basis; UNI = unreversed inclusions.
 
 import numpy as np
 import pandas as pd
-import pytest
 
-from main import compute_lot, compute_part1, LotResult
+from main import compute_lot, compute_part1, fifo_lots_from_transactions, LotResult
 
 
 FILEPATH = "test_input.xlsx"
@@ -549,3 +548,240 @@ class TestLotSummaryAggregation:
             "ordinary_losses": 0,
             "capital_losses": 0,
         }
+
+
+# -- FIFO lot construction from transactions --
+
+
+def _txn_df(rows):
+    return pd.DataFrame(rows, columns=TRANSACTION_COLUMNS)
+
+
+TRANSACTION_COLUMNS = ["Date", "Type", "Number of shares", "Total Value", "Exchange Rate"]
+
+
+class TestFIFOSimpleBuys:
+    # Two buys, no sells → two lots, unchanged
+    def test_two_buys_no_sells(self):
+        df_txn = _txn_df(
+            [
+                {
+                    "Date": _dt(2022, 1, 15),
+                    "Type": "buy",
+                    "Number of shares": 100,
+                    "Total Value": 5000.0,
+                    "Exchange Rate": 1.0,
+                },
+                {
+                    "Date": _dt(2022, 6, 1),
+                    "Type": "buy",
+                    "Number of shares": 200,
+                    "Total Value": 11000.0,
+                    "Exchange Rate": 1.0,
+                },
+            ]
+        )
+        lots = fifo_lots_from_transactions(df_txn)
+        assert len(lots) == 2
+        assert lots.iloc[0]["Number of shares"] == 100
+        assert lots.iloc[0]["Price per share: Acquisition"] == 50.0
+        assert lots.iloc[0]["Cost: Acquisition"] == 5000.0
+        assert lots.iloc[0]["Exchange Rate: Acquisition"] == 1.0
+        assert pd.isna(lots.iloc[0]["Date: Sale"])
+        assert lots.iloc[1]["Number of shares"] == 200
+        assert lots.iloc[1]["Price per share: Acquisition"] == 55.0
+        assert pd.isna(lots.iloc[1]["Date: Sale"])
+
+
+class TestFIFOPartialSale:
+    # Buy 100, buy 200, sell 150 → lot 1 fully sold (100), lot 2 partially sold (50)
+    # Result: lot 1 (sold, 100 shares), lot 2 (sold, 50 shares), lot 2 remaining (150 shares)
+    def test_partial_sale_splits_lot(self):
+        df_txn = _txn_df(
+            [
+                {
+                    "Date": _dt(2022, 1, 15),
+                    "Type": "buy",
+                    "Number of shares": 100,
+                    "Total Value": 5000.0,
+                    "Exchange Rate": 1.0,
+                },
+                {
+                    "Date": _dt(2022, 6, 1),
+                    "Type": "buy",
+                    "Number of shares": 200,
+                    "Total Value": 11000.0,
+                    "Exchange Rate": 1.0,
+                },
+                {
+                    "Date": _dt(2023, 3, 10),
+                    "Type": "sell",
+                    "Number of shares": 150,
+                    "Total Value": 9750.0,
+                    "Exchange Rate": 1.0,
+                },
+            ]
+        )
+        lots = fifo_lots_from_transactions(df_txn)
+        assert len(lots) == 3
+
+        assert lots.iloc[0]["Number of shares"] == 100
+        assert lots.iloc[0]["Price per share: Acquisition"] == 50.0
+        assert lots.iloc[0]["Cost: Acquisition"] == 5000.0
+        assert lots.iloc[0]["Date: Sale"] == _dt(2023, 3, 10)
+        assert lots.iloc[0]["Price per share: Sale"] == 65.0
+        assert lots.iloc[0]["Exchange Rate: Sale"] == 1.0
+
+        assert lots.iloc[1]["Number of shares"] == 50
+        assert lots.iloc[1]["Price per share: Acquisition"] == 55.0
+        assert lots.iloc[1]["Cost: Acquisition"] == 2750.0
+        assert lots.iloc[1]["Date: Sale"] == _dt(2023, 3, 10)
+        assert lots.iloc[1]["Price per share: Sale"] == 65.0
+
+        assert lots.iloc[2]["Number of shares"] == 150
+        assert lots.iloc[2]["Price per share: Acquisition"] == 55.0
+        assert lots.iloc[2]["Cost: Acquisition"] == 8250.0
+        assert pd.isna(lots.iloc[2]["Date: Sale"])
+
+
+class TestFIFOUserExample:
+    # Buy 100 @ $50, buy 200 @ $55, sell 40 @ $65
+    # → Lot 1: 40 (sold), Lot 2: 60 (still held), Lot 3: 200 (still held)
+    def test_user_example(self):
+        df_txn = _txn_df(
+            [
+                {
+                    "Date": _dt(2022, 1, 15),
+                    "Type": "buy",
+                    "Number of shares": 100,
+                    "Total Value": 5000.0,
+                    "Exchange Rate": 1.0,
+                },
+                {
+                    "Date": _dt(2022, 6, 1),
+                    "Type": "buy",
+                    "Number of shares": 200,
+                    "Total Value": 11000.0,
+                    "Exchange Rate": 1.0,
+                },
+                {
+                    "Date": _dt(2023, 3, 10),
+                    "Type": "sell",
+                    "Number of shares": 40,
+                    "Total Value": 2600.0,
+                    "Exchange Rate": 1.0,
+                },
+            ]
+        )
+        lots = fifo_lots_from_transactions(df_txn)
+        assert len(lots) == 3
+
+        assert lots.iloc[0]["Number of shares"] == 40
+        assert lots.iloc[0]["Price per share: Acquisition"] == 50.0
+        assert lots.iloc[0]["Cost: Acquisition"] == 2000.0
+        assert lots.iloc[0]["Date: Sale"] == _dt(2023, 3, 10)
+        assert lots.iloc[0]["Price per share: Sale"] == 65.0
+
+        assert lots.iloc[1]["Number of shares"] == 60
+        assert lots.iloc[1]["Price per share: Acquisition"] == 50.0
+        assert lots.iloc[1]["Cost: Acquisition"] == 3000.0
+        assert pd.isna(lots.iloc[1]["Date: Sale"])
+
+        assert lots.iloc[2]["Number of shares"] == 200
+        assert lots.iloc[2]["Price per share: Acquisition"] == 55.0
+        assert lots.iloc[2]["Cost: Acquisition"] == 11000.0
+        assert pd.isna(lots.iloc[2]["Date: Sale"])
+
+
+class TestFIFOFullSale:
+    # Buy 100, sell 100 → one lot, fully sold
+    def test_full_sale(self):
+        df_txn = _txn_df(
+            [
+                {
+                    "Date": _dt(2022, 1, 15),
+                    "Type": "buy",
+                    "Number of shares": 100,
+                    "Total Value": 5000.0,
+                    "Exchange Rate": 1.0,
+                },
+                {
+                    "Date": _dt(2023, 3, 10),
+                    "Type": "sell",
+                    "Number of shares": 100,
+                    "Total Value": 6500.0,
+                    "Exchange Rate": 1.0,
+                },
+            ]
+        )
+        lots = fifo_lots_from_transactions(df_txn)
+        assert len(lots) == 1
+        assert lots.iloc[0]["Number of shares"] == 100
+        assert lots.iloc[0]["Date: Sale"] == _dt(2023, 3, 10)
+        assert lots.iloc[0]["Price per share: Sale"] == 65.0
+
+
+class TestFIFOMultipleSells:
+    # Buy 300, sell 100, sell 50 → one lot sold (100), one lot sold (50), 150 held
+    def test_multiple_sells(self):
+        df_txn = _txn_df(
+            [
+                {
+                    "Date": _dt(2022, 1, 15),
+                    "Type": "buy",
+                    "Number of shares": 300,
+                    "Total Value": 15000.0,
+                    "Exchange Rate": 1.0,
+                },
+                {
+                    "Date": _dt(2023, 3, 10),
+                    "Type": "sell",
+                    "Number of shares": 100,
+                    "Total Value": 6000.0,
+                    "Exchange Rate": 1.0,
+                },
+                {
+                    "Date": _dt(2023, 9, 15),
+                    "Type": "sell",
+                    "Number of shares": 50,
+                    "Total Value": 2750.0,
+                    "Exchange Rate": 0.9,
+                },
+            ]
+        )
+        lots = fifo_lots_from_transactions(df_txn)
+        assert len(lots) == 3
+
+        assert lots.iloc[0]["Number of shares"] == 100
+        assert lots.iloc[0]["Price per share: Sale"] == 60.0
+        assert lots.iloc[0]["Exchange Rate: Sale"] == 1.0
+
+        assert lots.iloc[1]["Number of shares"] == 50
+        assert lots.iloc[1]["Price per share: Sale"] == 55.0
+        assert lots.iloc[1]["Exchange Rate: Sale"] == 0.9
+
+        assert lots.iloc[2]["Number of shares"] == 150
+        assert pd.isna(lots.iloc[2]["Date: Sale"])
+
+
+class TestFIFOWithFees:
+    # Total Value includes commission/fees, so price per share is derived.
+    # Buy 100 shares, total cost 5050 (50/share + $50 commission)
+    # Price per share: Acquisition = 5050 / 100 = 50.50
+    def test_fees_included_in_total_value(self):
+        df_txn = _txn_df(
+            [
+                {
+                    "Date": _dt(2022, 1, 15),
+                    "Type": "buy",
+                    "Number of shares": 100,
+                    "Total Value": 5050.0,
+                    "Exchange Rate": 1.0,
+                },
+            ]
+        )
+        lots = fifo_lots_from_transactions(df_txn)
+        assert len(lots) == 1
+        assert lots.iloc[0]["Number of shares"] == 100
+        assert lots.iloc[0]["Price per share: Acquisition"] == 50.5
+        assert lots.iloc[0]["Cost: Acquisition"] == 5050.0

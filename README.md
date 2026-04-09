@@ -22,21 +22,16 @@ Now you need to fill out the XLSX files with the relevant data for each fund. Th
 
 ## Filling out the form
 
-### Lot Details
-For each transaction made, you need to fill out the lot details in the `Lot Details` sheet of the XLSX file. This includes:
-- Date of acquisition
-- Price per share at acquisition (in local currency)
-- Total amount paid (in local currency)
-- Exchange rate on purchase date (e.g. EUR to USD)
+### Transactions
+In the `Transactions` sheet, list every buy and sell transaction for the PFIC. The program will automatically construct FIFO share lots from these transactions. Columns:
 
-If the share lot was sold, you also need to fill out the sale details:
-- Date of sale
-- Price per share at sale (in local currency)
-- Exchange rate on sale date (e.g. EUR to USD)
+- **Date** — Date of the transaction
+- **Type** — `buy` (or `purchase`, `reinvestment`) for acquisitions; `sell` (or `sale`, `distribution`) for dispositions
+- **Number of shares** — Number of shares bought or sold
+- **Total Value** — Total value of the transaction in the local currency, including any commissions or fees (for buys, this is the cost; for sells, this is the proceeds)
+- **Exchange Rate** — Exchange rate from local currency to USD on the transaction date
 
-If it wasn't sold, leave the sale details blank.
-
-If you only sold part of the lot, you need to split it into two separate rows with the same acquisition date: one for the sold part and one for the remaining part. The remaining part should have the sale details left blank.
+When you sell fewer shares than a given lot held, the program will automatically split the lot into a sold portion and a remaining portion per FIFO rules.
 
 ### EOY Details
 In the `EOY Details` sheet, you need to fill out for each year:

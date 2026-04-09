@@ -79,18 +79,17 @@ F_14C = "f2_25[0]"  # Capital loss (sale, basis ≤ original)
 # ---------------------------------------------------------------------------
 # Expected XLSX column names
 # ---------------------------------------------------------------------------
-LOT_COLUMNS = [
-    "Date: Acquisition",
-    "Price per share: Acquisition",
-    "Number of shares",
-    "Cost: Acquisition",
-    "Exchange Rate: Acquisition",
-    "Date: Sale",
-    "Price per share: Sale",
-    "Exchange Rate: Sale",
-]
 EOY_COLUMNS = ["Year", "Price", "Exchange Rate"]
 PFIC_COLUMNS = ["PFIC Name", "PFIC Address", "PFIC Reference ID", "PFIC Share Class"]
+TRANSACTION_COLUMNS = [
+    "Date",
+    "Type",
+    "Number of shares",
+    "Total Value",
+    "Exchange Rate",
+]
+BUY_TYPES = {"buy", "purchase", "reinvestment"}
+SELL_TYPES = {"sell", "sale", "distribution"}
 
 # ---------------------------------------------------------------------------
 # Data classes for computation results
@@ -177,16 +176,11 @@ def validate_tax_year(tax_year_str: str) -> int:
     return 2000 + year_int
 
 
-def validate_xlsx_columns(
-    df: pd.DataFrame, expected: list, sheet_name: str, filepath: str
-):
+def validate_xlsx_columns(df: pd.DataFrame, expected: list, sheet_name: str, filepath: str):
     """Validate that a DataFrame has all expected columns. Exits with error if missing."""
     missing = [col for col in expected if col not in df.columns]
     if missing:
-        logging.error(
-            f"💥 Missing columns in sheet '{sheet_name}' of {filepath}: "
-            f"{', '.join(missing)}"
-        )
+        logging.error(f"💥 Missing columns in sheet '{sheet_name}' of {filepath}: {', '.join(missing)}")
         logging.error(f"   Expected: {', '.join(expected)}")
         logging.error(f"   Found:    {', '.join(df.columns)}")
         sys.exit(1)
@@ -215,32 +209,95 @@ def get_eoy_value(df_eoy: pd.DataFrame, year: int, column: str, filepath: str):
     return rows[column].values[0]
 
 
-def validate_sale_data_completeness(df_lot: pd.DataFrame, filepath: str):
-    """Ensure that rows with a sale price also have a sale exchange rate and date."""
-    for i in range(len(df_lot.index)):
-        sale_price = df_lot["Price per share: Sale"][i]
-        sale_er = df_lot["Exchange Rate: Sale"][i]
-        sale_date = df_lot["Date: Sale"][i]
-        has_price = not pd.isna(sale_price)
-        has_er = not pd.isna(sale_er)
-        has_date = not pd.isna(sale_date)
+# ---------------------------------------------------------------------------
+# FIFO lot construction from transactions
+# ---------------------------------------------------------------------------
 
-        if has_price and (not has_er or not has_date):
-            missing = []
-            if not has_er:
-                missing.append("Exchange Rate: Sale")
-            if not has_date:
-                missing.append("Date: Sale")
-            logging.error(
-                f"💥 Lot {i + 1} in {filepath} has a sale price but is missing: "
-                f"{', '.join(missing)}"
+
+def fifo_lots_from_transactions(df_txn: pd.DataFrame) -> pd.DataFrame:
+    """Convert a DataFrame of buy/sell transactions into Lot Details rows
+    using FIFO share matching.  Buys open lots; sells close lots in
+    buy-date order, splitting lots when a partial fill is needed."""
+
+    txns = df_txn.sort_values("Date").reset_index(drop=True)
+
+    open_lots = []
+    for _, row in txns.iterrows():
+        ttype = str(row["Type"]).strip().lower()
+        if ttype in BUY_TYPES:
+            total_value = row["Total Value"]
+            num_shares = row["Number of shares"]
+            open_lots.append(
+                {
+                    "Date: Acquisition": row["Date"],
+                    "Price per share: Acquisition": total_value / num_shares,
+                    "Number of shares": num_shares,
+                    "Cost: Acquisition": total_value,
+                    "Exchange Rate: Acquisition": row["Exchange Rate"],
+                    "Date: Sale": np.nan,
+                    "Price per share: Sale": np.nan,
+                    "Exchange Rate: Sale": np.nan,
+                    "_remaining": num_shares,
+                }
             )
-            sys.exit(1)
-        if (not has_price) and (has_er or has_date):
-            logging.warning(
-                f"⚠️  Lot {i + 1} in {filepath} has sale details but no sale price — "
-                "sale data will be ignored."
-            )
+        elif ttype in SELL_TYPES:
+            to_sell = row["Number of shares"]
+            sale_date = row["Date"]
+            sale_price = row["Total Value"] / row["Number of shares"]
+            sale_er = row["Exchange Rate"]
+            new_lots = []
+            for lot in open_lots:
+                if to_sell <= 0:
+                    new_lots.append(lot)
+                    continue
+                if lot["_remaining"] <= 0:
+                    new_lots.append(lot)
+                    continue
+                fill = min(lot["_remaining"], to_sell)
+                cost_per_share = lot["Cost: Acquisition"] / lot["_remaining"]
+                if fill < lot["_remaining"]:
+                    new_lots.append(
+                        {
+                            "Date: Acquisition": lot["Date: Acquisition"],
+                            "Price per share: Acquisition": lot["Price per share: Acquisition"],
+                            "Number of shares": fill,
+                            "Cost: Acquisition": fill * cost_per_share,
+                            "Exchange Rate: Acquisition": lot["Exchange Rate: Acquisition"],
+                            "Date: Sale": sale_date,
+                            "Price per share: Sale": sale_price,
+                            "Exchange Rate: Sale": sale_er,
+                            "_remaining": 0,
+                        }
+                    )
+                    remaining = lot["_remaining"] - fill
+                    lot["Number of shares"] = remaining
+                    lot["Cost: Acquisition"] = remaining * cost_per_share
+                    lot["_remaining"] = remaining
+                    new_lots.append(lot)
+                else:
+                    lot["Number of shares"] = fill
+                    lot["Cost: Acquisition"] = fill * cost_per_share
+                    lot["Date: Sale"] = sale_date
+                    lot["Price per share: Sale"] = sale_price
+                    lot["Exchange Rate: Sale"] = sale_er
+                    lot["_remaining"] = 0
+                    new_lots.append(lot)
+                to_sell -= fill
+            open_lots = new_lots
+            if to_sell > 0:
+                logging.warning(
+                    f"⚠️  Sell of {row['Number of shares']} shares on {sale_date} "
+                    f"exceeds available lots by {to_sell} shares."
+                )
+
+    result = []
+    for lot in open_lots:
+        if lot["_remaining"] > 0:
+            lot["Number of shares"] = lot["_remaining"]
+        del lot["_remaining"]
+        result.append(lot)
+
+    return pd.DataFrame(result)
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +305,7 @@ def validate_sale_data_completeness(df_lot: pd.DataFrame, filepath: str):
 # ---------------------------------------------------------------------------
 
 
-def compute_part1(
-    df_lot: pd.DataFrame, df_eoy: pd.DataFrame, current_year: int, filepath: str
-) -> Part1Result:
+def compute_part1(df_lot: pd.DataFrame, df_eoy: pd.DataFrame, current_year: int, filepath: str) -> Part1Result:
     """Compute Part I results (shared logic for both PDF and text)."""
     date_of_acq = (
         pd.to_datetime(df_lot["Date: Acquisition"].values[0]).strftime("%Y-%m-%d")
@@ -326,16 +381,12 @@ def compute_lot(
                 unreversed = unreversed_amount
                 ordinary_loss = -min(unreversed, -sale_gain_loss)
                 capital_loss = None
-                logging.info(
-                    f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(ordinary_loss)}"
-                )
+                logging.info(f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(ordinary_loss)}")
             else:
                 unreversed = None
                 ordinary_loss = 0
                 capital_loss = sale_gain_loss
-                logging.info(
-                    f"    📉 Lot {lot + 1}: Capital loss of ${abs(sale_gain_loss)}"
-                )
+                logging.info(f"    📉 Lot {lot + 1}: Capital loss of ${abs(sale_gain_loss)}")
         else:
             unreversed = None
             ordinary_loss = None
@@ -369,15 +420,11 @@ def compute_lot(
             if unreversed_amount > 0:
                 unreversed = unreversed_amount
                 ordinary_loss = -min(unreversed, -gain_loss)
-                logging.info(
-                    f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(ordinary_loss)}"
-                )
+                logging.info(f"    📉 Lot {lot + 1}: Ordinary loss of ${abs(ordinary_loss)}")
             else:
                 unreversed = 0
                 ordinary_loss = 0
-                logging.info(
-                    f"    📉 Lot {lot + 1}: Unrecognizable loss of ${abs(gain_loss)}"
-                )
+                logging.info(f"    📉 Lot {lot + 1}: Unrecognizable loss of ${abs(gain_loss)}")
             capital_loss = None
         else:
             unreversed = None
@@ -477,9 +524,7 @@ def _lot_fields(lot_result: LotResult) -> dict | None:
             fields[F_11] = ""
             fields[F_12] = ""
 
-        fields.update(
-            {F_13A: "", F_13B: "", F_13C: "", F_14A: "", F_14B: "", F_14C: ""}
-        )
+        fields.update({F_13A: "", F_13B: "", F_13C: "", F_14A: "", F_14B: "", F_14C: ""})
 
     else:
         # Sold lot
@@ -512,16 +557,19 @@ def _lot_fields(lot_result: LotResult) -> dict | None:
 def load_xlsx(xlsx_path: str) -> tuple:
     """Load and validate an XLSX input file. Returns (df_lot, df_eoy, df_pfic)."""
     logging.info(f"  📂 Reading {xlsx_path}")
-    df_lot = pd.read_excel(xlsx_path, sheet_name="Lot Details")
-    df_eoy = pd.read_excel(xlsx_path, sheet_name="EOY Details")
-    df_pfic = pd.read_excel(xlsx_path, sheet_name="PFIC Details")
+    xls = pd.ExcelFile(xlsx_path)
 
-    validate_xlsx_columns(df_lot, LOT_COLUMNS, "Lot Details", xlsx_path)
+    df_txn = pd.read_excel(xls, sheet_name="Transactions")
+    validate_xlsx_columns(df_txn, TRANSACTION_COLUMNS, "Transactions", xlsx_path)
+    df_lot = fifo_lots_from_transactions(df_txn)
+
+    df_eoy = pd.read_excel(xls, sheet_name="EOY Details")
+    df_pfic = pd.read_excel(xls, sheet_name="PFIC Details")
+
     validate_xlsx_columns(df_eoy, EOY_COLUMNS, "EOY Details", xlsx_path)
     validate_xlsx_columns(df_pfic, PFIC_COLUMNS, "PFIC Details", xlsx_path)
 
     validate_reference_id(str(df_pfic["PFIC Reference ID"].values[0]))
-    validate_sale_data_completeness(df_lot, xlsx_path)
 
     return df_lot, df_eoy, df_pfic
 
@@ -672,7 +720,7 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
         f"City/State/Zip       : {data_dict['City']}, {data_dict['State']}, {data_dict['Country']}, {data_dict['Postal Code']}"
     )
     lines.append(f"Tax year             : 20{data_dict['Tax year']}")
-    lines.append(f"Type of shareholder  : Individual")
+    lines.append("Type of shareholder  : Individual")
     lines.append("")
 
     # ── PFIC info ───────────────────────────────────────────────────────────
@@ -689,7 +737,7 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
     lines.append(f"Date of Acquisition  : {part1.date_of_acq}")
     lines.append(f"Number of Shares     : {part1.unsold_shares}")
     lines.append(f"FMV (line 1f / §1296): ${part1.value_of_pfic}")
-    lines.append(f"Part II election     : Mark-to-Market (checked)")
+    lines.append("Part II election     : Mark-to-Market (checked)")
     lines.append("")
 
     # ── Part IV — one block per lot ─────────────────────────────────────────
@@ -710,13 +758,11 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
                     lines.append(f"  11   Unreversed inclusions    : ${lot_result.unreversed}")
                     lines.append(f"  12   Ordinary loss             : ${lot_result.ordinary_loss}")
                 else:
-                    lines.append(f"  11   Unreversed inclusions    : $0")
-                    lines.append(
-                        f"  12   Ordinary loss             : $0  (non-deductible)"
-                    )
+                    lines.append("  11   Unreversed inclusions    : $0")
+                    lines.append("  12   Ordinary loss             : $0  (non-deductible)")
             else:
-                lines.append(f"  11   Unreversed inclusions    : (n/a)")
-                lines.append(f"  12   Ordinary loss             : (n/a)")
+                lines.append("  11   Unreversed inclusions    : (n/a)")
+                lines.append("  12   Ordinary loss             : (n/a)")
 
         else:
             lines.append(f"── Part IV — Lot {actual_lots + 1} (sold in {tax_year}) ──")
@@ -728,15 +774,15 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
                 if lot_result.adjusted_basis > lot_result.original_basis:
                     lines.append(f"  14a  Unreversed inclusions    : ${lot_result.unreversed}")
                     lines.append(f"  14b  Ordinary loss             : ${lot_result.ordinary_loss}")
-                    lines.append(f"  14c  Capital loss              : (n/a)")
+                    lines.append("  14c  Capital loss              : (n/a)")
                 else:
-                    lines.append(f"  14a  Unreversed inclusions    : $0")
-                    lines.append(f"  14b  Ordinary loss             : $0")
+                    lines.append("  14a  Unreversed inclusions    : $0")
+                    lines.append("  14b  Ordinary loss             : $0")
                     lines.append(f"  14c  Capital loss              : ${lot_result.capital_loss}")
             else:
-                lines.append(f"  14a  Unreversed inclusions    : (n/a)")
-                lines.append(f"  14b  Ordinary loss             : (n/a)")
-                lines.append(f"  14c  Capital loss              : (n/a)")
+                lines.append("  14a  Unreversed inclusions    : (n/a)")
+                lines.append("  14b  Ordinary loss             : (n/a)")
+                lines.append("  14c  Capital loss              : (n/a)")
 
         lines.append("")
         actual_lots += 1
@@ -756,9 +802,7 @@ def generate_text_output(path: str, data_dict: dict, xlsx: str):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Fill out IRS Form 8621 for Mark-to-Market (MTM) elections."
-    )
+    parser = argparse.ArgumentParser(description="Fill out IRS Form 8621 for Mark-to-Market (MTM) elections.")
     parser.add_argument(
         "--format",
         choices=["pdf", "txt"],
@@ -825,9 +869,7 @@ def read_inputs(args):
         logging.info("📝 Enter shareholder details:")
 
         data_dict["Name of shareholder"] = input("👤 Name of shareholder: ")
-        data_dict["Identifying Number"] = getpass.getpass(
-            "🆔 Identifying Number (e.g., SSN)"
-        )
+        data_dict["Identifying Number"] = getpass.getpass("🆔 Identifying Number (e.g., SSN)")
         data_dict["Address"] = input("🏠 Address (Street + House Number): ")
         address_line_2 = input("🏠 Address line 2 (or press Enter to skip): ").strip()
         data_dict["Address line 2"] = address_line_2 if address_line_2 else ""
@@ -869,8 +911,7 @@ def main():
         data_dict, files = read_inputs(args)
         if not files:
             logging.error(
-                "💥 No input files found in the inputs directory. "
-                "Please consult the README for instructions."
+                "💥 No input files found in the inputs directory. Please consult the README for instructions."
             )
             sys.exit(1)
 
@@ -910,34 +951,20 @@ def main():
 
         logging.info("")
         logging.info("=" * 60)
-        logging.info(
-            f"📋 SUMMARY OF GAINS AND LOSSES FOR TAX YEAR 20{data_dict['Tax year']}"
-        )
+        logging.info(f"📋 SUMMARY OF GAINS AND LOSSES FOR TAX YEAR 20{data_dict['Tax year']}")
         logging.info("=" * 60)
 
         if total_summary["ordinary_gains"] > 0:
-            logging.info(
-                f"💰 Total Ordinary Gains: ${total_summary['ordinary_gains']:.2f}"
-            )
-            logging.info(
-                "   ➡️  Add this amount to your ordinary income on your tax return"
-            )
+            logging.info(f"💰 Total Ordinary Gains: ${total_summary['ordinary_gains']:.2f}")
+            logging.info("   ➡️  Add this amount to your ordinary income on your tax return")
             logging.info("")
         if total_summary["ordinary_losses"] > 0:
-            logging.info(
-                f"📉 Total Ordinary Losses: ${total_summary['ordinary_losses']:.2f}"
-            )
-            logging.info(
-                "   ➡️  Include this amount as an ordinary loss on your tax return"
-            )
+            logging.info(f"📉 Total Ordinary Losses: ${total_summary['ordinary_losses']:.2f}")
+            logging.info("   ➡️  Include this amount as an ordinary loss on your tax return")
             logging.info("")
         if total_summary["capital_losses"] > 0:
-            logging.info(
-                f"📉 Total Capital Losses: ${total_summary['capital_losses']:.2f}"
-            )
-            logging.info(
-                "   ➡️  Report according to capital loss rules in the Code and regulations"
-            )
+            logging.info(f"📉 Total Capital Losses: ${total_summary['capital_losses']:.2f}")
+            logging.info("   ➡️  Report according to capital loss rules in the Code and regulations")
             logging.info("")
 
         if all(v == 0 for v in total_summary.values()):
