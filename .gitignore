@@ -1,7 +1,9 @@
-inputs/
-outputs/
+inputs/*
+outputs/*
 __pycache__
 
 *.xlsx#
 .venv
 .ruff_cache
+
+!inputs/.gitkeep
