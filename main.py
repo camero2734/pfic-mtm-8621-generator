@@ -9,6 +9,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pandas_datareader.data as web
 import pikepdf
 
 # ---------------------------------------------------------------------------
@@ -79,17 +80,122 @@ F_14C = "f2_25[0]"  # Capital loss (sale, basis ≤ original)
 # ---------------------------------------------------------------------------
 # Expected XLSX column names
 # ---------------------------------------------------------------------------
-EOY_COLUMNS = ["Year", "Price", "Exchange Rate"]
-PFIC_COLUMNS = ["PFIC Name", "PFIC Address", "PFIC Reference ID", "PFIC Share Class"]
+EOY_COLUMNS = ["Year", "Price"]
+PFIC_COLUMNS = ["PFIC Name", "PFIC Address", "PFIC Reference ID", "PFIC Share Class", "Currency"]
 TRANSACTION_COLUMNS = [
     "Date",
     "Type",
     "Number of shares",
     "Total Value",
-    "Exchange Rate",
 ]
 BUY_TYPES = {"buy", "purchase", "reinvestment"}
 SELL_TYPES = {"sell", "sale", "distribution"}
+
+# FRED exchange rate series codes.
+# These map a currency code to the FRED series that gives "USD per 1 unit of foreign currency".
+# Rates are expressed as: foreign_amount * rate = USD_amount.
+FRED_FX_SERIES = {
+    "AUD": "DEXUSAL",
+    "BRL": "DEXBZUS",
+    "CAD": "DEXCAUS",
+    "CHF": "DEXSZUS",
+    "CNY": "DEXCHUS",
+    "DKK": "DEXDNUS",
+    "EUR": "DEXUSEU",
+    "GBP": "DEXUSUK",
+    "HKD": "DEEXHKUS",
+    "INR": "DEXINUS",
+    "JPY": "DEXJPUS",
+    "KRW": "DEXKOUS",
+    "MXN": "DEXMXUS",
+    "NOK": "DEXNOUS",
+    "NZD": "DEXUSNZ",
+    "SEK": "DEXSDUS",
+    "SGD": "DEXSIUS",
+    "TWD": "DEXTWUS",
+    "THB": "DEXTHUS",
+    "ZAR": "DEEXZAUS",
+}
+
+# Cache: {currency: {date: rate}}
+_fx_cache: dict = {}
+
+
+def get_exchange_rate(currency: str, date) -> float:
+    """Look up the USD exchange rate for a currency on a given date via FRED.
+    Returns the rate such that: USD_amount = foreign_amount * rate.
+    For currencies with a direct USD series (e.g. DEXUSEU for EUR), uses it directly.
+    For others, falls back to converting via EUR.
+    """
+    currency = currency.upper().strip()
+    if currency == "USD":
+        return 1.0
+
+    date = pd.Timestamp(date)
+    if currency not in _fx_cache or date not in _fx_cache[currency]:
+        _prefetch_rates(currency, date)
+
+    if currency in _fx_cache and date in _fx_cache[currency]:
+        return _fx_cache[currency][date]
+
+    raise ValueError(
+        f"Could not find exchange rate for {currency} on {date.date()}. "
+        f"Ensure the date is a business day or add the rate manually."
+    )
+
+
+def _prefetch_rates(currency: str, date):
+    """Fetch a range of rates from FRED for the given currency around the date.
+    FRED only publishes rates on US business days, so we fetch a small window
+    and use the nearest available rate.
+    """
+    if currency not in FRED_FX_SERIES:
+        raise ValueError(
+            f"Currency '{currency}' is not in the FRED series mapping. "
+            f"Supported currencies: {sorted(FRED_FX_SERIES.keys())}"
+        )
+
+    series = FRED_FX_SERIES[currency]
+    start = date - pd.Timedelta(days=10)
+    end = date + pd.Timedelta(days=10)
+
+    try:
+        df = web.DataReader(series, "fred", start, end)
+    except Exception as e:
+        raise ValueError(f"Failed to fetch FRED series {series}: {e}") from e
+
+    if df.empty:
+        raise ValueError(f"No data returned from FRED for {series} around {date.date()}")
+
+    series_col = df.columns[0]
+
+    # Most FRED FX series are "foreign currency per USD" (e.g. DEXJPUS = JPY/USD).
+    # A few are "USD per foreign unit" (DEXUSEU = USD/EUR, DEXUSUK = USD/GBP, etc.).
+    # We normalize everything to "USD per 1 unit of foreign currency".
+    # Series starting with DEXUS are already USD/foreign; others need inversion.
+    if series.startswith("DEXUS") or series.startswith("DEEX"):
+        usd_per_foreign = df[series_col]
+    else:
+        usd_per_foreign = 1.0 / df[series_col]
+
+    if currency not in _fx_cache:
+        _fx_cache[currency] = {}
+
+    for idx, val in usd_per_foreign.items():
+        if pd.notna(val):
+            _fx_cache[currency][pd.Timestamp(idx)] = float(val)
+
+    # If exact date not available (weekend/holiday), use nearest prior business day
+    if date not in _fx_cache[currency]:
+        available = sorted(_fx_cache[currency].keys())
+        prior = [d for d in available if d <= date]
+        if prior:
+            _fx_cache[currency][date] = _fx_cache[currency][prior[-1]]
+        else:
+            nearest = [d for d in available if d >= date]
+            if nearest:
+                _fx_cache[currency][date] = _fx_cache[currency][nearest[0]]
+
 
 # ---------------------------------------------------------------------------
 # Data classes for computation results
@@ -214,10 +320,11 @@ def get_eoy_value(df_eoy: pd.DataFrame, year: int, column: str, filepath: str):
 # ---------------------------------------------------------------------------
 
 
-def fifo_lots_from_transactions(df_txn: pd.DataFrame) -> pd.DataFrame:
+def fifo_lots_from_transactions(df_txn: pd.DataFrame, currency: str) -> pd.DataFrame:
     """Convert a DataFrame of buy/sell transactions into Lot Details rows
     using FIFO share matching.  Buys open lots; sells close lots in
-    buy-date order, splitting lots when a partial fill is needed."""
+    buy-date order, splitting lots when a partial fill is needed.
+    Exchange rates are looked up from FRED based on the currency."""
 
     txns = df_txn.sort_values("Date").reset_index(drop=True)
 
@@ -227,13 +334,14 @@ def fifo_lots_from_transactions(df_txn: pd.DataFrame) -> pd.DataFrame:
         if ttype in BUY_TYPES:
             total_value = row["Total Value"]
             num_shares = row["Number of shares"]
+            er = get_exchange_rate(currency, row["Date"])
             open_lots.append(
                 {
                     "Date: Acquisition": row["Date"],
                     "Price per share: Acquisition": total_value / num_shares,
                     "Number of shares": num_shares,
                     "Cost: Acquisition": total_value,
-                    "Exchange Rate: Acquisition": row["Exchange Rate"],
+                    "Exchange Rate: Acquisition": er,
                     "Date: Sale": np.nan,
                     "Price per share: Sale": np.nan,
                     "Exchange Rate: Sale": np.nan,
@@ -244,7 +352,7 @@ def fifo_lots_from_transactions(df_txn: pd.DataFrame) -> pd.DataFrame:
             to_sell = row["Number of shares"]
             sale_date = row["Date"]
             sale_price = row["Total Value"] / row["Number of shares"]
-            sale_er = row["Exchange Rate"]
+            sale_er = get_exchange_rate(currency, sale_date)
             new_lots = []
             for lot in open_lots:
                 if to_sell <= 0:
@@ -555,23 +663,44 @@ def _lot_fields(lot_result: LotResult) -> dict | None:
 
 
 def load_xlsx(xlsx_path: str) -> tuple:
-    """Load and validate an XLSX input file. Returns (df_lot, df_eoy, df_pfic)."""
+    """Load and validate an XLSX input file. Returns (df_lot, df_eoy, df_pfic).
+    Exchange rates are looked up from FRED based on the Currency field in PFIC Details.
+    """
     logging.info(f"  📂 Reading {xlsx_path}")
     xls = pd.ExcelFile(xlsx_path)
 
     df_txn = pd.read_excel(xls, sheet_name="Transactions")
     validate_xlsx_columns(df_txn, TRANSACTION_COLUMNS, "Transactions", xlsx_path)
-    df_lot = fifo_lots_from_transactions(df_txn)
 
     df_eoy = pd.read_excel(xls, sheet_name="EOY Details")
-    df_pfic = pd.read_excel(xls, sheet_name="PFIC Details")
-
     validate_xlsx_columns(df_eoy, EOY_COLUMNS, "EOY Details", xlsx_path)
+
+    df_pfic = pd.read_excel(xls, sheet_name="PFIC Details")
     validate_xlsx_columns(df_pfic, PFIC_COLUMNS, "PFIC Details", xlsx_path)
 
     validate_reference_id(str(df_pfic["PFIC Reference ID"].values[0]))
 
+    currency = str(df_pfic["Currency"].values[0]).strip().upper()
+    logging.info(f"  💱 Currency: {currency}")
+
+    df_lot = fifo_lots_from_transactions(df_txn, currency)
+    df_eoy = add_eoy_exchange_rates(df_eoy, currency)
+
     return df_lot, df_eoy, df_pfic
+
+
+def add_eoy_exchange_rates(df_eoy: pd.DataFrame, currency: str) -> pd.DataFrame:
+    """Add an Exchange Rate column to the EOY DataFrame by looking up
+    December 31 exchange rates from FRED for each year."""
+    df_eoy = df_eoy.copy()
+    rates = []
+    for _, row in df_eoy.iterrows():
+        date = pd.Timestamp(year=int(row["Year"]), month=12, day=31)
+        rate = get_exchange_rate(currency, date)
+        rates.append(rate)
+        logging.info(f"  💱 {currency}/USD on {date.date()}: {rate:.4f}")
+    df_eoy["Exchange Rate"] = rates
+    return df_eoy
 
 
 # ---------------------------------------------------------------------------

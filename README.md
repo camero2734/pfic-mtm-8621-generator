@@ -29,18 +29,18 @@ In the `Transactions` sheet, list every buy and sell transaction for the PFIC. T
 - **Type** — `buy` (or `purchase`, `reinvestment`) for acquisitions; `sell` (or `sale`, `distribution`) for dispositions
 - **Number of shares** — Number of shares bought or sold
 - **Total Value** — Total value of the transaction in the local currency, including any commissions or fees (for buys, this is the cost; for sells, this is the proceeds)
-- **Exchange Rate** — Exchange rate from local currency to USD on the transaction date
 
-When you sell fewer shares than a given lot held, the program will automatically split the lot into a sold portion and a remaining portion per FIFO rules.
+Exchange rates are looked up automatically from the Federal Reserve's historical daily rates.
 
 ### EOY Details
-In the `EOY Details` sheet, you need to fill out for each year:
+In the `EOY Details` sheet, fill out for each year:
 - The year
 - The FMV of a share of the PFIC on December 31st (in local currency)
-- The exchange rate on December 31st (e.g. EUR to USD)
+
+Exchange rates for December 31st of each year are looked up automatically.
 
 ### PFIC Details
-In the `PFIC Details` sheet, you need to fill out:
+In the `PFIC Details` sheet, fill out:
 - The name of the PFIC (e.g. Vanguard FTSE All-World UCITS ETF)
 - The address of the PFIC (you can usually find this in the Prospectus by searching for "Registered Office")
 - The reference ID
@@ -49,6 +49,7 @@ In the `PFIC Details` sheet, you need to fill out:
   - From the IRS:
     > The reference ID number must be alphanumeric [A-Z, 0-9] and no special characters or spaces are permitted. The length of a given reference ID number is limited to 50 characters.
 - The share class (you can usually find this in the Prospectus by searching for "Share Class")
+- The currency — ISO 4217 code (e.g. EUR, GBP, JPY) for the local currency the PFIC is denominated in
 
 ## Running the program
 To run the program, first install `uv` by following the instructions in the [uv documentation](https://docs.astral.sh/uv/getting-started/installation/).
@@ -73,3 +74,10 @@ This will ask you several questions in the terminal:
 That's all of the data needed. It will then generate a PDF for each PFIC in the `outputs/YEAR` folder, named `REFERENCE_ID.pdf`. For example, if you have `vwce.xlsx` and `spyy.xlsx` in the `inputs` folder, and run the program for 2025, it will generate:
 - `outputs/2025/vwce.pdf`
 - `outputs/2025/spyy.pdf`
+
+## Running tests
+You can run tests via:
+
+```sh
+uv run pytest
+```
