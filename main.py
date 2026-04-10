@@ -1325,6 +1325,9 @@ def read_inputs(args):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.getLogger('weasyprint').setLevel(logging.ERROR)
+    logging.getLogger('fontTools.subset').setLevel(logging.WARNING)
+    logging.getLogger('fontTools.ttLib.ttFont').setLevel(logging.WARNING)
     logging.info("🚀 Form 8621 Filler Initialized")
 
     args = parse_args()
