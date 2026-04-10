@@ -75,6 +75,8 @@ That's all of the data needed. It will then generate a PDF for each PFIC in the 
 - `outputs/2025/vwce.pdf`
 - `outputs/2025/spyy.pdf`
 
+Additionally, a supporting calculations document is generated as `outputs/2025/2025_supporting.pdf`. This PDF contains the year-by-year AdB/UNI roll-forward tables for each PFIC, showing how the adjusted basis and unreversed inclusions evolved over time, along with the exchange rates and FMV calculations that produce each Form 8621 line item value.
+
 ## Running tests
 You can run tests via:
 

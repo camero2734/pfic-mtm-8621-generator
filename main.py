@@ -450,22 +450,22 @@ def compute_lot(
     num_shares = float(df_lot["Number of shares"][lot])
     original_basis = cost_acquisition * er_of_acquisition
 
-    aab = original_basis
+    adb = original_basis
     uni = 0.0
     roll_forward = []
     for year in range(year_of_acquisition, current_year):
         price = get_eoy_value(df_eoy, year, "Price", filepath)
         fx = get_eoy_value(df_eoy, year, "Exchange Rate", filepath)
         fmv = round(num_shares * price * fx)
-        raw_mtm = fmv - aab
-        aab_before = aab
+        raw_mtm = fmv - adb
+        adb_before = adb
         if raw_mtm >= 0:
-            aab = aab + raw_mtm
+            adb = adb + raw_mtm
             uni = uni + raw_mtm
             allowed_loss = 0
         else:
             allowed_loss = min(-raw_mtm, uni)
-            aab = aab - allowed_loss
+            adb = adb - allowed_loss
             uni = uni - allowed_loss
         roll_forward.append(
             {
@@ -473,14 +473,14 @@ def compute_lot(
                 "eoy_price": price,
                 "eoy_fx": fx,
                 "fmv": fmv,
-                "aab_begin": round(aab_before),
+                "adb_begin": round(adb_before),
                 "raw_mtm": raw_mtm,
                 "allowed_loss": allowed_loss,
-                "aab_end": round(aab),
+                "adb_end": round(adb),
                 "uni_end": round(uni),
             }
         )
-    adjusted_basis = round(aab)
+    adjusted_basis = round(adb)
     unreversed_amount = round(uni)
 
     if not np.isnan(df_lot["Price per share: Sale"][lot]):
@@ -1134,10 +1134,10 @@ def generate_supporting_pdf(output_path: str, data_dict: dict, xlsx_files: list)
                 parts.append(f"<td>{fmt_money(entry['eoy_price'], currency)}</td>")
                 parts.append(f"<td>{fmt_fx(entry['eoy_fx'])}</td>")
                 parts.append(f"<td>{fmt_money(entry['fmv'])}</td>")
-                parts.append(f"<td>{fmt_money(entry['aab_begin'])}</td>")
+                parts.append(f"<td>{fmt_money(entry['adb_begin'])}</td>")
                 parts.append(f"<td>{fmt_money(entry['raw_mtm'])}</td>")
                 parts.append(f"<td>{fmt_money(entry['allowed_loss'])}</td>")
-                parts.append(f"<td>{fmt_money(entry['aab_end'])}</td>")
+                parts.append(f"<td>{fmt_money(entry['adb_end'])}</td>")
                 parts.append(f"<td>{fmt_money(entry['uni_end'])}</td>")
                 parts.append("</tr>")
 
@@ -1325,9 +1325,9 @@ def read_inputs(args):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    logging.getLogger('weasyprint').setLevel(logging.ERROR)
-    logging.getLogger('fontTools.subset').setLevel(logging.WARNING)
-    logging.getLogger('fontTools.ttLib.ttFont').setLevel(logging.WARNING)
+    logging.getLogger("weasyprint").setLevel(logging.ERROR)
+    logging.getLogger("fontTools.subset").setLevel(logging.WARNING)
+    logging.getLogger("fontTools.ttLib.ttFont").setLevel(logging.WARNING)
     logging.info("🚀 Form 8621 Filler Initialized")
 
     args = parse_args()

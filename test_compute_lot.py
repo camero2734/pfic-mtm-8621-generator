@@ -1,10 +1,10 @@
 """
 
-AAB = adjusted adjusted basis; UNI = unreversed inclusions.
+AdB = adjusted adjusted basis; UNI = unreversed inclusions.
 
 §1296 requires:
-  - MTM inclusion = FMV(EOY) - AAB(BOY), not FMV(EOY) - FMV(BOY)
-  - AAB rolls forward: AAB(EOY) = AAB(BOY) + gain - allowed_loss
+  - MTM inclusion = FMV(EOY) - AdB(BOY), not FMV(EOY) - FMV(BOY)
+  - AdB rolls forward: AdB(EOY) = AdB(BOY) + gain - allowed_loss
   - UNI rolls forward: UNI(EOY) = UNI(BOY) + gain - allowed_loss
   - Loss limitation is per-lot
 """
@@ -44,7 +44,7 @@ def _make_lot_df(rows):
     return pd.DataFrame(result)
 
 
-# -- Acquisition year (AAB = original basis) --
+# -- Acquisition year (AdB = original basis) --
 
 
 class TestAcquisitionYearHolding:
@@ -88,12 +88,12 @@ class TestAcquisitionYearHolding:
         assert result.ordinary_loss == 0
 
 
-# -- Second year after a gain (AAB = FMV prior year, coincidentally correct) --
+# -- Second year after a gain (AdB = FMV prior year, coincidentally correct) --
 
 
 class TestSecondYearGainAfterGain:
     def test_gain_after_prior_gain(self):
-        # Year 1: gain → AAB(EOY) = FMV. Year 2: another gain on that basis.
+        # Year 1: gain → AdB(EOY) = FMV. Year 2: another gain on that basis.
         df_lot = _make_lot_df(
             [
                 {
@@ -139,7 +139,7 @@ class TestSaleInCurrentYear:
         assert result.sale_gain_loss == 1500
 
     def test_sale_loss_with_uni(self):
-        # Sale loss with AAB > original basis → ordinary loss limited by UNI
+        # Sale loss with AdB > original basis → ordinary loss limited by UNI
         df_lot = _make_lot_df(
             [
                 {
@@ -162,7 +162,7 @@ class TestSaleInCurrentYear:
         assert result.ordinary_loss == -1500
 
     def test_sale_loss_no_uni(self):
-        # Sale loss with AAB == original basis → entire loss is capital
+        # Sale loss with AdB == original basis → entire loss is capital
         df_lot = _make_lot_df(
             [
                 {
@@ -251,13 +251,13 @@ class TestPart1:
         assert result.value_of_pfic == 18000
 
 
-# -- Prior year losses force AAB != FMV --
+# -- Prior year losses force AdB != FMV --
 
 
 class TestDeniedLossPreservesBasis:
-    # Denied loss (no UNI) leaves AAB unchanged. Next year's AAB(BOY) must
+    # Denied loss (no UNI) leaves AdB unchanged. Next year's AdB(BOY) must
     # reflect that, not use prior-year FMV.
-    # 2023: acquire 100@$100, FX1.0 → loss $2000 denied (UNI=0) → AAB stays $10000
+    # 2023: acquire 100@$100, FX1.0 → loss $2000 denied (UNI=0) → AdB stays $10000
     # 2024: price $110, FMV=$11000 → gain = $11000-$10000 = $1000
     def test_denied_loss_preserves_basis(self):
         df_lot = _make_lot_df(
@@ -286,10 +286,10 @@ class TestDeniedLossPreservesBasis:
 
 class TestPartialLossFollowedByGain:
     # Loss partially absorbed by UNI, then a gain year.
-    # 2022: gain $1000 → AAB=$6000, UNI=$1000
-    # 2023: loss $1500, allowed $1000 → AAB=$5000, UNI=$0
+    # 2022: gain $1000 → AdB=$6000, UNI=$1000
+    # 2023: loss $1500, allowed $1000 → AdB=$5000, UNI=$0
     # 2024: FMV=$5500 → gain = $5500-$5000 = $500
-    def test_aab_after_partial_loss(self):
+    def test_adb_after_partial_loss(self):
         df_lot = _make_lot_df(
             [
                 {
@@ -309,9 +309,9 @@ class TestPartialLossFollowedByGain:
 
 class TestLossMisclassifiedAfterPriorLoss:
     # After partial loss absorption, a small FMV increase still represents a loss.
-    # 2022: gain $1000 → AAB=$6000, UNI=$1000
-    # 2023: loss $1500, allowed $1000 → AAB=$5000, UNI=$0
-    # 2024: FMV=$4700 → AAB=$5000 → non-deductible loss of $300 (not a gain)
+    # 2022: gain $1000 → AdB=$6000, UNI=$1000
+    # 2023: loss $1500, allowed $1000 → AdB=$5000, UNI=$0
+    # 2024: FMV=$4700 → AdB=$5000 → non-deductible loss of $300 (not a gain)
     def test_loss_not_gain_after_prior_loss(self):
         df_lot = _make_lot_df(
             [
@@ -334,10 +334,10 @@ class TestLossMisclassifiedAfterPriorLoss:
 
 class TestMultiYearCarryforward:
     # Figure 6 from the PFIC.xyz article:
-    # 2019: gain $2000 → AAB=$7000, UNI=$2000
-    # 2020: loss $1500, allowed $1500 → AAB=$5500, UNI=$500
-    # 2021: loss $1000, allowed $500 → AAB=$5000, UNI=$0
-    # 2022: gain $1500 → AAB=$6500, UNI=$1500
+    # 2019: gain $2000 → AdB=$7000, UNI=$2000
+    # 2020: loss $1500, allowed $1500 → AdB=$5500, UNI=$500
+    # 2021: loss $1000, allowed $500 → AdB=$5000, UNI=$0
+    # 2022: gain $1500 → AdB=$6500, UNI=$1500
     def test_2020_loss_after_gain(self):
         df_lot = _make_lot_df(
             [
@@ -406,7 +406,7 @@ class TestMultiYearCarryforward:
 class TestFXRateAfterDeniedLoss:
     # FX change after a denied loss.
     # 2023: acquire 100@€50, FX1.0 → basis $5000; price €40, FX1.0 → denied loss
-    # 2024: price €55, FX1.2 → FMV=$6600, AAB=$5000 → gain $1600
+    # 2024: price €55, FX1.2 → FMV=$6600, AdB=$5000 → gain $1600
     def test_fx_with_denied_loss(self):
         df_lot = _make_lot_df(
             [
